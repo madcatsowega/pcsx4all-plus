@@ -201,6 +201,9 @@ void config_load()
 		} else if (!strcmp(line, "Cdda")) {
 			sscanf(arg, "%d", &value);
 			Config.Cdda = value;
+		} else if (!strcmp(line, "AsyncCD")) {
+			sscanf(arg, "%d", &value);
+			Config.AsyncCD = value;
 		} else if (!strcmp(line, "HLE")) {
 			sscanf(arg, "%d", &value);
 			Config.HLE = value;
@@ -360,6 +363,7 @@ void config_save()
 		   "Mdec %d\n"
 		   "PsxAuto %d\n"
 		   "Cdda %d\n"
+		   "AsyncCD %d\n"
 		   "HLE %d\n"
 		   "SlowBoot %d\n"
 		   "RCntFix %d\n"
@@ -376,7 +380,7 @@ void config_save()
 		   "FrameLimit %d\n"
 		   "FrameSkip %d\n",
 		   CONFIG_VERSION, Config.Xa, Config.Mdec, Config.PsxAuto,
-		   Config.Cdda, Config.HLE, Config.SlowBoot, Config.RCntFix, Config.VSyncWA,
+		   Config.Cdda, Config.AsyncCD, Config.HLE, Config.SlowBoot, Config.RCntFix, Config.VSyncWA,
 		   Config.Cpu, Config.PsxType, Config.McdSlot1, Config.McdSlot2, Config.SpuIrq, Config.SyncAudio,
 		   Config.SpuUpdateFreq, Config.ForcedXAUpdates, Config.ShowFps, Config.FrameLimit,
 		   Config.FrameSkip);
@@ -696,6 +700,7 @@ int main (int argc, char **argv)
 	Config.PsxAuto=1; /* 1=autodetect system (pal or ntsc) */
 	Config.PsxType=0; /* PSX_TYPE_NTSC=ntsc, PSX_TYPE_PAL=pal */
 	Config.Cdda=0; /* 0=Enable Cd audio, 1=Disable Cd audio */
+	Config.AsyncCD=0; /* 0=Synchronous Cd access, 1=Asynchronous Cd access */
 	Config.HLE=1; /* 0=BIOS, 1=HLE */
 #if defined (PSXREC)
 	Config.Cpu=0; /* 0=recompiler, 1=interpreter */

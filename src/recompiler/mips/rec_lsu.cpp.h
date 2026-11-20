@@ -1011,12 +1011,12 @@ static void general_loads_stores(const int  count,
 					case 0xa0000000: // SB
 						ADDIU(MIPSREG_A0, rs, op_imm);
 						JAL(write_func[WIDTH_8]);
-						MOV(MIPSREG_A1, rt); // <BD> Branch delay slot
+						ANDI(MIPSREG_A1, rt, 0xff); // <BD> Branch delay slot (MIPS o32 ABI: caller zero-extends u8)
 						break;
 					case 0xa4000000: // SH
 						ADDIU(MIPSREG_A0, rs, op_imm);
 						JAL(write_func[WIDTH_16]);
-						MOV(MIPSREG_A1, rt); // <BD> Branch delay slot
+						ANDI(MIPSREG_A1, rt, 0xffff); // <BD> Branch delay slot (MIPS o32 ABI: caller zero-extends u16)
 						break;
 					case 0xac000000: // SW
 						ADDIU(MIPSREG_A0, rs, op_imm);

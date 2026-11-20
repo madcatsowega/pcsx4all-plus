@@ -185,6 +185,9 @@ static const char *wildcards[] = {
 	// TODO: adapt PCSX Rearmed's cdrcimg.c plugin to get these
 	//"z", "bz", "znx",
 
+#ifdef HAVE_CHD
+	"chd",
+#endif
 	"bin", "img", "mdf", "iso", "cue",
 	"pbp", "cbn", NULL
 };
@@ -1274,11 +1277,34 @@ static char *McdSlot2_show()
 	return buf;
 }
 
+static int AsyncCD_alter(u32 keys)
+{
+	if (keys & KEY_RIGHT) {
+		if (Config.AsyncCD == false) Config.AsyncCD = true;
+	} else if (keys & KEY_LEFT) {
+		if (Config.AsyncCD == true) Config.AsyncCD = false;
+	}
+	return 0;
+}
+
+static char *AsyncCD_show()
+{
+	static char buf[16] = "\0";
+	sprintf(buf, "%s", Config.AsyncCD == true ? "Async" : "Sync");
+	return buf;
+}
+
+static void AsyncCD_hint()
+{
+	port_printf(4 * 8, 150, "Async CD read thread (restart game)");
+}
+
 static int settings_defaults()
 {
 	/* Restores settings to default values. */
 	Config.Mdec = 0;
 	Config.PsxAuto = 1;
+	Config.AsyncCD = 0;
 	Config.HLE = 1;
 	Config.SlowBoot = 0;
 	Config.RCntFix = 0;
@@ -1301,6 +1327,7 @@ static MENUITEM gui_SettingsItems[] = {
 	{(char *)"Cycle multiplier ", NULL, &cycle_alter, &cycle_show, NULL},
 #endif
 	{(char *)"PSX BIOS         ", &bios_set, &bios_alter, &bios_show, &psx_bios_hint},
+	{(char *)"CD Access        ", NULL, &AsyncCD_alter, &AsyncCD_show, &AsyncCD_hint},
 	{(char *)"Skip BIOS logos  ", NULL, &SlowBoot_alter, &SlowBoot_show, &SlowBoot_hint},
 	{(char *)"RCntFix          ", NULL, &RCntFix_alter, &RCntFix_show, &RCntFix_hint},
 	{(char *)"VSyncWA          ", NULL, &VSyncWA_alter, &VSyncWA_show, &VSyncWA_hint},

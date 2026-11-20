@@ -80,8 +80,9 @@ int renderer_init(void)
   gpu_unai.ilace_mask = gpu_unai.config.ilace_force;
 
 #ifdef GPU_UNAI_USE_INT_DIV_MULTINV
-  // s_invTable
-  for(int i=1;i<=(1<<TABLE_BITS);++i)
+  // s_invTable (indexed directly by uDen in gpu_fixedpoint.h: s_invTable[uDen])
+  s_invTable[0] = 0x7fffffff;
+  for(int i=1;i<(1<<TABLE_BITS);++i)
   {
     double v = 1.0 / double(i);
 #ifdef GPU_TABLE_10_BITS
@@ -89,7 +90,7 @@ int renderer_init(void)
 #else
     v *= double(0x80000000);
 #endif
-    s_invTable[i-1]=s32(v);
+    s_invTable[i]=s32(v);
   }
 #endif
 

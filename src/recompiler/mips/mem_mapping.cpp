@@ -113,7 +113,17 @@ int rec_mmap_psx_mem()
 	}
 
 	// Map PSX RAM to start at fixed virtual address specified in mem_mapping.h
-	//  (usually 0x1000_0000)
+	//  (usually 0x1000_0000, or 0x0000_0000 with MMAP_TO_ADDRESS_ZERO)
+#ifdef MMAP_TO_ADDRESS_ZERO
+	{
+		// Ensure kernel allows mapping at virtual address 0 (RetroFW runs as root)
+		int fd_min = open("/proc/sys/vm/mmap_min_addr", O_WRONLY);
+		if (fd_min >= 0) {
+			if (write(fd_min, "0\n", 2) < 0) {}
+			close(fd_min);
+		}
+	}
+#endif
 	mmap_retval = mmap((void*)PSX_MEM_VADDR, 0x200000,
 			PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, memfd, 0);
 	if (mmap_retval == MAP_FAILED) {

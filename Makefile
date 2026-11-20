@@ -14,17 +14,14 @@ USE_GPULIB ?= 1
 GPU  = gpu_unai
 SPU  = spu_pcsxrearmed
 
-CHAINPREFIX := /opt/mipsel-RetroFW-linux-uclibc
-CROSS_COMPILE := $(CHAINPREFIX)/usr/bin/mipsel-linux-
-
-CC = $(CROSS_COMPILE)gcc
-CXX = $(CROSS_COMPILE)g++
-STRIP = $(CROSS_COMPILE)strip
+CC ?= mipsel-linux-gcc
+CXX ?= mipsel-linux-g++
+STRIP ?= mipsel-linux-strip
 
 RECOMPILER = mips
 
 RM     = rm -f
-MD     = mkdir
+MD     = mkdir -p
 LD     = $(CXX)
 
 SYSROOT     := $(shell $(CC) --print-sysroot)
@@ -35,12 +32,17 @@ SDL_LIBS    := $(shell $(SDL_CONFIG) --libs)
 MCD1_FILE = \"mcd001.mcr\"
 MCD2_FILE = \"mcd002.mcr\"
 
-C_ARCH = -mips32 -DDYNAREC_SKIP_DCACHE_FLUSH -DTMPFS_MIRRORING -DTMPFS_DIR=\"/tmp\" -DRS97
-OPTS = -O2 -mno-fp-exceptions -mframe-header-opt -mno-check-zero-division -fno-signed-zeros -fno-trapping-math -mno-interlink-compressed -fno-caller-saves -flto
+C_ARCH = -mips32 -mhard-float -mno-mips16 -mplt -mno-shared -DMMAP_TO_ADDRESS_ZERO -DDYNAREC_SKIP_DCACHE_FLUSH -DTMPFS_MIRRORING -DTMPFS_DIR=\"/tmp\" -DRS97
+# Non-LTO on GCC 7.3 outperforms GCC 11+ LTO on JZ4760B's 16 KB L1 I-cache
+OPTS = -O3 -fomit-frame-pointer -fwrapv -fno-strict-aliasing -mno-fp-exceptions -mframe-header-opt -mno-check-zero-division -fno-signed-zeros -fno-trapping-math -mno-interlink-compressed -fno-caller-saves
+ifeq ($(PGO),generate)
+OPTS += -fprofile-generate -fprofile-dir=/home/retrofw/profile/pcsx4all
+endif
+ifeq ($(PGO),use)
+OPTS += -fprofile-use -fprofile-dir=./profile -fprofile-correction -Wno-missing-profile -Wno-error=coverage-mismatch
+endif
 
-# CFLAGS = $(C_ARCH) -fno-common -mno-abicalls -fno-PIC -fdata-sections -ffunction-sections $(OPTS) -DGCW_ZERO \
-
-CFLAGS = $(C_ARCH) -fno-common -mno-abicalls -fno-PIC -fdata-sections -ffunction-sections $(OPTS) -DGCW_ZERO \
+CFLAGS = $(C_ARCH) -fno-common -fdata-sections -ffunction-sections $(OPTS) -DGCW_ZERO \
 	-Wall -Wunused -Wpointer-arith \
 	-Wno-sign-compare -Wno-cast-align \
 	-Isrc -Isrc/spu/$(SPU) -D$(SPU) -Isrc/gpu/$(GPU) \
@@ -53,16 +55,16 @@ CFLAGS = $(C_ARCH) -fno-common -mno-abicalls -fno-PIC -fdata-sections -ffunction
 # Convert plugin names to uppercase and make them CFLAG defines
 CFLAGS += -D$(shell echo $(GPU) | tr a-z A-Z)
 CFLAGS += -D$(shell echo $(SPU) | tr a-z A-Z)
-CFLAGS += -DFORCE_MEMCPY32
+CFLAGS += -DFORCE_MEMCPY32 -DGPU_UNAI_USE_INT_DIV_MULTINV
 
 ifdef RECOMPILER
 CFLAGS += -DPSXREC -D$(RECOMPILER)
 endif
 
-CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -nostdinc++
+CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 
-LDFLAGS = -nodefaultlibs -lc -lgcc -lSDL -lz -Wl,--as-needed -Wl,--gc-sections -flto -s
-LDFLAGS += $(SDL_LIBS) -lSDL_mixer -lSDL_image -lrt
+LDFLAGS = $(C_ARCH) $(OPTS) -Wl,-Ttext-segment=0x40000000 -lz -Wl,--as-needed -Wl,--gc-sections -s
+LDFLAGS += $(SDL_LIBS) -lSDL_mixer -lSDL_image -lrt -lpthread -lm
 
 OBJDIRS = obj obj/gpu obj/gpu/$(GPU) obj/spu obj/spu/$(SPU) \
 	  obj/recompiler obj/recompiler/$(RECOMPILER) \
@@ -122,19 +124,12 @@ OBJS += obj/plugin_lib/perfmon.o
 # Use a non-default SPU update frequency for these slower devices
 #  to avoid audio dropouts. 0: once-per-frame (default)   5: 32-times-per-frame
 #
-#  On slower Dingoo A320, update 8 times per frame
-CFLAGS += -DSPU_UPDATE_FREQ_DEFAULT=3
-##########
-
-##########
-# Similarly, set higher XA audio update frequency for slower devices
-#
-#  On slower Dingoo A320, force XA to update 8 times per frame (val 4)
-CFLAGS += -DFORCED_XA_UPDATES_DEFAULT=4
-##########
+# On RS-97 Plus (528-696 MHz), 2x/frame SPU & XA updates avoid Dingoo A320's 8x overhead
+CFLAGS += -DSPU_UPDATE_FREQ_DEFAULT=1
+CFLAGS += -DFORCED_XA_UPDATES_DEFAULT=1
 
 ifeq ($(SPU),spu_pcsxrearmed)
-# Specify which audio backend to use:
+# Use SDL audio backend (JZ4760B OSS driver rejects pcsxrearmed's SNDCTL_DSP_RESET)
 SOUND_DRIVERS=sdl
 #SOUND_DRIVERS=alsa
 #SOUND_DRIVERS=oss
@@ -179,6 +174,43 @@ endif
 # spu_pcsxrearmed END
 #******************************************
 
+#******************************************
+# libchdr section BEGIN
+#******************************************
+HAVE_CHD ?= 1
+ifeq "$(HAVE_CHD)" "1"
+
+OBJDIRS += \
+	obj/external_lib/lzma-19.00/src \
+	obj/external_lib/libchdr/src
+
+OBJS += \
+	obj/external_lib/lzma-19.00/src/Alloc.o \
+	obj/external_lib/lzma-19.00/src/Bra86.o \
+	obj/external_lib/lzma-19.00/src/BraIA64.o \
+	obj/external_lib/lzma-19.00/src/CpuArch.o \
+	obj/external_lib/lzma-19.00/src/Delta.o \
+	obj/external_lib/lzma-19.00/src/LzFind.o \
+	obj/external_lib/lzma-19.00/src/Lzma86Dec.o \
+	obj/external_lib/lzma-19.00/src/LzmaDec.o \
+	obj/external_lib/lzma-19.00/src/LzmaEnc.o \
+	obj/external_lib/lzma-19.00/src/Sort.o \
+	obj/external_lib/libchdr/src/libchdr_bitstream.o \
+	obj/external_lib/libchdr/src/libchdr_cdrom.o \
+	obj/external_lib/libchdr/src/libchdr_chd.o \
+	obj/external_lib/libchdr/src/libchdr_flac.o \
+	obj/external_lib/libchdr/src/libchdr_huffman.o
+
+CFLAGS += \
+	-Isrc/external_lib/lzma-19.00/include \
+	-Isrc/external_lib/libchdr/include \
+	-DHAVE_CHD -D_7ZIP_ST
+
+endif
+#******************************************
+# libchdr section END
+#******************************************
+
 CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions
 
 #If V=1 was passed to 'make', do not hide commands:
@@ -195,6 +227,11 @@ $(TARGET): $(OBJS)
 obj/%.o: src/%.c
 	@echo Compiling $<...
 	$(HIDECMD)$(CC) -std=gnu99 $(CFLAGS) -c $< -o $@
+
+# Inline-asm MIPS JIT dispatcher in recompiler.cpp must not be gcov-instrumented
+obj/recompiler/mips/recompiler.o: src/recompiler/mips/recompiler.cpp
+	@echo Compiling $<...
+	@$(CXX) $(filter-out -fprofile-generate -fprofile-dir=%,$(CXXFLAGS)) -c $< -o $@
 
 obj/%.o: src/%.cpp
 	@echo Compiling $<...

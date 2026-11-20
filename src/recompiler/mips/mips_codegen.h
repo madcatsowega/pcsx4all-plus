@@ -322,6 +322,9 @@ do { \
 #define MULT(rs, rt) \
 	write32(0x00000018 | ((rs) << 21) | ((rt) << 16))
 
+#define MADD(rs, rt) \
+	write32(0x70000000 | ((rs) << 21) | ((rt) << 16))
+
 #define MULTU(rs, rt) \
 	write32(0x00000019 | ((rs) << 21) | ((rt) << 16))
 

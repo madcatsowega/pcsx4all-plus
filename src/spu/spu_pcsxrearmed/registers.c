@@ -122,7 +122,7 @@ void CALLBACK SPUwriteRegister(unsigned long reg, unsigned short val,
    {
     //-------------------------------------------------//
     case H_SPUaddr:
-      spu.spuAddr = (unsigned long) val<<3;
+      spu.spuAddr = ((unsigned long) val<<3) & 0x7fff8;
       break;
     //-------------------------------------------------//
     case H_SPUdata:

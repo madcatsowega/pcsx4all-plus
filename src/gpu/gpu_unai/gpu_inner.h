@@ -459,7 +459,7 @@ const PS gpuSpriteSpanDrivers[256] = {
 //             relevant blend/light headers.
 // (see README_senquack.txt)
 template<int CF>
-static void gpuPolySpanFn(const gpu_unai_t &gpu_unai, u16 *pDst, u32 count)
+static void gpuPolySpanFn(const gpu_unai_t & __restrict__ gpu_unai, u16 * __restrict__ pDst, u32 count)
 {
 	// Blend func can save an operation if it knows uSrc MSB is unset.
 	//  Untextured prims can always skip this (src color MSB is always 0).
@@ -551,8 +551,8 @@ endpolynotextgou:
 		u32 l_u = gpu_unai.u & l_u_msk;   u32 l_v = gpu_unai.v & l_v_msk;
 		s32 l_u_inc = gpu_unai.u_inc;     s32 l_v_inc = gpu_unai.v_inc;
 
-		const u16* TBA_ = gpu_unai.TBA;
-		const u16* CBA_; if (CF_TEXTMODE!=3) CBA_ = gpu_unai.CBA;
+		const u16* __restrict__ TBA_ = gpu_unai.TBA;
+		const u16* __restrict__ CBA_; if (CF_TEXTMODE!=3) CBA_ = gpu_unai.CBA;
 
 		u8 r5, g5, b5;
 		u8 r8, g8, b8;

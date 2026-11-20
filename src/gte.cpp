@@ -432,28 +432,46 @@ void gteRTPS(void) {
 void gteRTPT(void) {
 	int quotient;
 	int v;
-	s32 vx, vy, vz;
 
 #ifdef GTE_LOG
 	GTE_LOG("GTE RTPT\n");
 #endif
 	gteFLAG = 0;
 
+	const s32 r11 = gteR11, r12 = gteR12, r13 = gteR13;
+	const s32 r21 = gteR21, r22 = gteR22, r23 = gteR23;
+	const s32 r31 = gteR31, r32 = gteR32, r33 = gteR33;
+	const s64 trx = (s64)gteTRX << 12;
+	const s64 try_ = (s64)gteTRY << 12;
+	const s64 trz = (s64)gteTRZ << 12;
+	const s64 ofx = (s64)gteOFX;
+	const s64 ofy = (s64)gteOFY;
+	const u16 h   = gteH;
+
 	gteSZ0 = gteSZ3;
 	for (v = 0; v < 3; v++) {
-		vx = VX(v);
-		vy = VY(v);
-		vz = VZ(v);
-		gteMAC1 = A1((((s64)gteTRX << 12) + (gteR11 * vx) + (gteR12 * vy) + (gteR13 * vz)) >> 12);
-		gteMAC2 = A2((((s64)gteTRY << 12) + (gteR21 * vx) + (gteR22 * vy) + (gteR23 * vz)) >> 12);
-		gteMAC3 = A3((((s64)gteTRZ << 12) + (gteR31 * vx) + (gteR32 * vy) + (gteR33 * vz)) >> 12);
-		gteIR1 = limB1(gteMAC1, 0);
-		gteIR2 = limB2(gteMAC2, 0);
-		gteIR3 = limB3(gteMAC3, 0);
-		fSZ(v) = limD(gteMAC3);
-		quotient = limE(DIVIDE(gteH, fSZ(v)));
-		fSX(v) = limG1(F((s64)gteOFX + ((s64)gteIR1 * quotient)) >> 16);
-		fSY(v) = limG2(F((s64)gteOFY + ((s64)gteIR2 * quotient)) >> 16);
+		s32 vx = VX(v);
+		s32 vy = VY(v);
+		s32 vz = VZ(v);
+		s32 mac1 = A1((trx + (s64)(r11 * vx) + (s64)(r12 * vy) + (s64)(r13 * vz)) >> 12);
+		s32 mac2 = A2((try_ + (s64)(r21 * vx) + (s64)(r22 * vy) + (s64)(r23 * vz)) >> 12);
+		s32 mac3 = A3((trz + (s64)(r31 * vx) + (s64)(r32 * vy) + (s64)(r33 * vz)) >> 12);
+		s32 ir1 = limB1(mac1, 0);
+		s32 ir2 = limB2(mac2, 0);
+		s32 ir3 = limB3(mac3, 0);
+		u16 sz  = limD(mac3);
+		fSZ(v) = sz;
+		quotient = limE(DIVIDE(h, sz));
+		fSX(v) = limG1(F(ofx + ((s64)ir1 * quotient)) >> 16);
+		fSY(v) = limG2(F(ofy + ((s64)ir2 * quotient)) >> 16);
+		if (v == 2) {
+			gteMAC1 = mac1;
+			gteMAC2 = mac2;
+			gteMAC3 = mac3;
+			gteIR1 = ir1;
+			gteIR2 = ir2;
+			gteIR3 = ir3;
+		}
 	}
 
 	// See note in gteRTPS()

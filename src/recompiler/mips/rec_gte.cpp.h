@@ -45,7 +45,48 @@ void rec##f() \
 }
 
 CP2_FUNC_0(RTPS)
-CP2_FUNC_0(NCLIP)
+static void recNCLIP()
+{
+	// Inline GTE NCLIP directly in MIPS32 dynarec (no C function call, preserves $v0/$ra/LSU cache!)
+	// gteFLAG = 0;
+	// mac0 = (s64)SX0*(SY1 - SY2) + (s64)SX1*(SY2 - SY0) + (s64)SX2*(SY0 - SY1);
+	// Check 32-bit signed overflow via HI != (LO >> 31)
+	const u32 sx0 = TEMP_0;
+	const u32 sy0 = TEMP_1;
+	const u32 sx1 = TEMP_2;
+	const u32 sy1 = TEMP_3;
+	const u32 sx2 = MIPSREG_T4;
+	const u32 sy2 = MIPSREG_T5;
+	const u32 diff = MIPSREG_T6;
+	const u32 hi = MIPSREG_T7;
+
+	LH(sx0, PERM_REG_1, off(CP2D.p[12].sw.l));
+	LH(sy0, PERM_REG_1, off(CP2D.p[12].sw.h));
+	LH(sx1, PERM_REG_1, off(CP2D.p[13].sw.l));
+	LH(sy1, PERM_REG_1, off(CP2D.p[13].sw.h));
+	LH(sx2, PERM_REG_1, off(CP2D.p[14].sw.l));
+	LH(sy2, PERM_REG_1, off(CP2D.p[14].sw.h));
+
+	SUBU(diff, sy1, sy2);
+	MULT(sx0, diff);
+	SUBU(diff, sy2, sy0);
+	MADD(sx1, diff);
+	SUBU(diff, sy0, sy1);
+	MADD(sx2, diff);
+
+	MFLO(sx0);
+	MFHI(hi);
+	SRA(sy0, sx0, 31);          // expected sign-extension of LO
+	SW(sx0, PERM_REG_1, off(CP2D.r[24])); // gteMAC0 = LO
+	SUBU(diff, hi, sy0);        // non-zero iff 32-bit signed overflow
+	LUI(sx1, 0x8001);           // (1<<31)|(1<<16) positive overflow
+	LUI(sx2, 0x8000);
+	ORI(sx2, sx2, 0x8000);      // (1<<31)|(1<<15) negative overflow
+	SLT(sy1, hi, 0);            // sy1 = (hi < 0)
+	MOVN(sx1, sx2, sy1);        // sx1 = overflow flag
+	MOVZ(sx1, 0, diff);         // if no overflow, gteFLAG = 0
+	SW(sx1, PERM_REG_1, offCP2C(31));
+}
 CP2_FUNC_0(NCDS)
 CP2_FUNC_0(NCDT)
 CP2_FUNC_0(CDP)
@@ -54,8 +95,97 @@ CP2_FUNC_0(CC)
 CP2_FUNC_0(NCS)
 CP2_FUNC_0(NCT)
 CP2_FUNC_0(DPCT)
-CP2_FUNC_0(AVSZ3)
-CP2_FUNC_0(AVSZ4)
+static void recAVSZ3()
+{
+	// Inline GTE AVSZ3 directly in MIPS32 dynarec
+	const u32 sum  = TEMP_0;
+	const u32 zsf3 = TEMP_1;
+	const u32 lo   = TEMP_2;
+	const u32 hi   = TEMP_3;
+	const u32 tmp1 = MIPSREG_T4;
+	const u32 tmp2 = MIPSREG_T5;
+	const u32 flag = MIPSREG_T6;
+	const u32 otz  = MIPSREG_T7;
+
+	LHU(sum,  PERM_REG_1, off(CP2D.p[17].w.l)); // SZ1
+	LHU(tmp1, PERM_REG_1, off(CP2D.p[18].w.l)); // SZ2
+	LHU(tmp2, PERM_REG_1, off(CP2D.p[19].w.l)); // SZ3
+	LH(zsf3,  PERM_REG_1, off(CP2C.p[29].sw.l));// ZSF3
+	ADDU(sum, sum, tmp1);
+	ADDU(sum, sum, tmp2);
+	MULT(zsf3, sum);
+	MFLO(lo);
+	MFHI(hi);
+	SRA(tmp1, lo, 31);
+	SW(lo, PERM_REG_1, off(CP2D.r[24]));        // gteMAC0
+	SUBU(tmp2, hi, tmp1);
+	LUI(flag, 0x8001);
+	LUI(tmp1, 0x8000);
+	ORI(tmp1, tmp1, 0x8000);
+	SLT(otz, hi, 0);
+	MOVN(flag, tmp1, otz);
+	MOVZ(flag, 0, tmp2);
+
+	// otz = limD(lo >> 12) in [0..0xffff]
+	SRA(otz, lo, 12);
+	LUI(tmp1, 0x8004);                          // (1<<31)|(1<<18)
+	OR(tmp1, flag, tmp1);
+	SLT(tmp2, otz, 0);
+	MOVN(otz, 0, tmp2);
+	MOVN(flag, tmp1, tmp2);
+	ORI(lo, 0, 0xffff);
+	SLT(tmp2, lo, otz);
+	MOVN(otz, lo, tmp2);
+	MOVN(flag, tmp1, tmp2);
+	SW(otz, PERM_REG_1, off(CP2D.r[7]));        // gteOTZ (32-bit zero-ext u16)
+	SW(flag, PERM_REG_1, offCP2C(31));
+}
+static void recAVSZ4()
+{
+	// Inline GTE AVSZ4 directly in MIPS32 dynarec
+	const u32 sum  = TEMP_0;
+	const u32 zsf4 = TEMP_1;
+	const u32 lo   = TEMP_2;
+	const u32 hi   = TEMP_3;
+	const u32 tmp1 = MIPSREG_T4;
+	const u32 tmp2 = MIPSREG_T5;
+	const u32 flag = MIPSREG_T6;
+	const u32 otz  = MIPSREG_T7;
+
+	LHU(sum,  PERM_REG_1, off(CP2D.p[16].w.l)); // SZ0
+	LHU(tmp1, PERM_REG_1, off(CP2D.p[17].w.l)); // SZ1
+	LHU(tmp2, PERM_REG_1, off(CP2D.p[18].w.l)); // SZ2
+	LHU(otz,  PERM_REG_1, off(CP2D.p[19].w.l)); // SZ3
+	LH(zsf4,  PERM_REG_1, off(CP2C.p[30].sw.l));// ZSF4
+	ADDU(sum, sum, tmp1);
+	ADDU(tmp2, tmp2, otz);
+	ADDU(sum, sum, tmp2);
+	MULT(zsf4, sum);
+	MFLO(lo);
+	MFHI(hi);
+	SRA(tmp1, lo, 31);
+	SW(lo, PERM_REG_1, off(CP2D.r[24]));        // gteMAC0
+	SUBU(tmp2, hi, tmp1);
+	LUI(flag, 0x8001);
+	LUI(tmp1, 0x8000);
+	ORI(tmp1, tmp1, 0x8000);
+	SLT(otz, hi, 0);
+	MOVN(flag, tmp1, otz);
+	MOVZ(flag, 0, tmp2);
+
+	SRA(otz, lo, 12);
+	LUI(tmp1, 0x8004);                          // (1<<31)|(1<<18)
+	OR(tmp1, flag, tmp1);
+	SLT(tmp2, otz, 0);
+	MOVN(otz, 0, tmp2);
+	MOVN(flag, tmp1, tmp2);
+	ORI(lo, 0, 0xffff);
+	SLT(tmp2, lo, otz);
+	MOVN(otz, lo, tmp2);
+	MOVN(flag, tmp1, tmp2);
+	SW(otz, PERM_REG_1, off(CP2D.r[7]));
+	SW(flag, PERM_REG_1, offCP2C(31));
+}
 CP2_FUNC_0(RTPT)
 CP2_FUNC_0(NCCT)
 CP2_FUNC_1(OP)
