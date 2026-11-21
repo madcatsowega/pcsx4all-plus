@@ -656,6 +656,31 @@ static int do_samples_noise(int ch, int ns_to)
  return ret;
 }
 
+#ifdef RS97
+extern void jz_mxu_enable(void);
+extern void mix_chan_mxu(int *SSumLR, const int *ChanBuf, int count, unsigned int lv_rv);
+extern void mix_chan_rvb_mxu(int *SSumLR, const int *ChanBuf, int count, unsigned int lv_rv, int *rvb);
+extern void finish_samples_mxu(int *SSumLR, short *pS, int ns_to);
+
+static int spu_use_mxu = 0;
+
+static void spu_detect_and_enable_mxu(void)
+{
+ FILE *f = fopen("/proc/cpuinfo", "r");
+ char line[256];
+ if (!f) return;
+ while (fgets(line, sizeof(line), f)) {
+  if (strstr(line, "ASEs implemented") && strstr(line, "mxu")) {
+   jz_mxu_enable();
+   spu_use_mxu = 1;
+   printf("-> JZ4760B MXU SIMD enabled for SPU mixing.\n");
+   break;
+  }
+ }
+ fclose(f);
+}
+#endif
+
 #ifdef HAVE_ARMV5
 // asm code; lv and rv must be 0-3fff
 extern void mix_chan(int *SSumLR, int count, int lv, int rv);
@@ -663,6 +688,12 @@ extern void mix_chan_rvb(int *SSumLR, int count, int lv, int rv, int *rvb);
 #else
 static void mix_chan(int *SSumLR, int count, int lv, int rv)
 {
+#ifdef RS97
+ if (spu_use_mxu) {
+  mix_chan_mxu(SSumLR, ChanBuf, count, ((unsigned int)lv << 16) | (rv & 0xffff));
+  return;
+ }
+#endif
  const int *src = ChanBuf;
  int l, r;
 
@@ -679,6 +710,12 @@ static void mix_chan(int *SSumLR, int count, int lv, int rv)
 
 static void mix_chan_rvb(int *SSumLR, int count, int lv, int rv, int *rvb)
 {
+#ifdef RS97
+ if (spu_use_mxu) {
+  mix_chan_rvb_mxu(SSumLR, ChanBuf, count, ((unsigned int)lv << 16) | (rv & 0xffff), rvb);
+  return;
+ }
+#endif
  const int *src = ChanBuf;
  int *dst = SSumLR;
  int *drvb = rvb;
@@ -1192,6 +1229,13 @@ static void do_samples_finish(int *SSumLR, int ns_to,
     memset(spu.pS, 0, ns_to * 2 * sizeof(spu.pS[0]));
     spu.pS += ns_to * 2;
    }
+#ifdef RS97
+  else if (spu_use_mxu && volmult == 1024 && (((uintptr_t)spu.pS) & 3) == 0)
+   {
+    finish_samples_mxu(SSumLR, spu.pS, ns_to);
+    spu.pS += ns_to * 2;
+   }
+#endif
   else
   for (ns = 0; ns < ns_to * 2; )
    {
@@ -1508,6 +1552,9 @@ long CALLBACK SPUinit(void)
   }
 
  spu.bSpuInit=1;                                       // flag: we are inited
+#ifdef RS97
+ spu_detect_and_enable_mxu();
+#endif
 
  return 0;
 }

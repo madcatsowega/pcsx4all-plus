@@ -140,6 +140,9 @@ SOUND_DRIVERS=sdl
 OBJS += obj/spu/spu_pcsxrearmed/dma.o obj/spu/spu_pcsxrearmed/freeze.o \
 	obj/spu/spu_pcsxrearmed/out.o obj/spu/spu_pcsxrearmed/nullsnd.o \
 	obj/spu/spu_pcsxrearmed/registers.o
+ifdef RS97
+OBJS += obj/spu/spu_pcsxrearmed/spu_mxu.o
+endif
 ifeq "$(ARCH)" "arm"
 OBJS += obj/spu/spu_pcsxrearmed/arm_utils.o
 endif
