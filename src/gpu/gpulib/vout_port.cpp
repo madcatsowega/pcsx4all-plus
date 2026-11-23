@@ -104,14 +104,25 @@ static inline void GPU_Blit320(const void* src, u16* dst16, bool isRGB24)
 		const u32* src32 = (const u32*) src;
 		u32* dst32 = (u32*)(void*) dst16;
 		do {
-			dst32[0] = RGB16X2(src32[0]);
-			dst32[1] = RGB16X2(src32[1]);
-			dst32[2] = RGB16X2(src32[2]);
-			dst32[3] = RGB16X2(src32[3]);
-			dst32[4] = RGB16X2(src32[4]);
-			dst32[5] = RGB16X2(src32[5]);
-			dst32[6] = RGB16X2(src32[6]);
-			dst32[7] = RGB16X2(src32[7]);
+#ifdef __mips__
+			__asm__ __volatile__("pref 0, 64(%0)" : : "r"(src32));
+#endif
+			u32 s0 = src32[0];
+			u32 s1 = src32[1];
+			u32 s2 = src32[2];
+			u32 s3 = src32[3];
+			dst32[0] = RGB16X2(s0);
+			dst32[1] = RGB16X2(s1);
+			dst32[2] = RGB16X2(s2);
+			dst32[3] = RGB16X2(s3);
+			u32 s4 = src32[4];
+			u32 s5 = src32[5];
+			u32 s6 = src32[6];
+			u32 s7 = src32[7];
+			dst32[4] = RGB16X2(s4);
+			dst32[5] = RGB16X2(s5);
+			dst32[6] = RGB16X2(s6);
+			dst32[7] = RGB16X2(s7);
 			dst32 += 8;
 			src32 += 8;
 		} while(--uCount);
@@ -382,39 +393,83 @@ static inline void GPU_Blit368(const void* src, u16* dst16, bool isRGB24/*, u32 
 			}*/
 		}
 		uCount = 22;
-		dst16[0] = RGB16(src16[0]);
-		dst16++;
-		src16++;
-		do {
-			dst16[ 0] = RGB16(src16[0]);
-			dst16[ 1] = RGB16(src16[1]);
-			dst16[ 2] = RGB16(src16[2]);
-			dst16[ 3] = RGB16(src16[3]);
-			dst16[ 4] = RGB16(src16[4]);
-			dst16[ 5] = RGB16(src16[5]);
-			dst16[ 6] = RGB16_AVG(&src16[6]);
-			dst16[ 7] = RGB16(src16[8]);
-			dst16[ 8] = RGB16(src16[9]);
-			dst16[ 9] = RGB16(src16[10]);
-			dst16[10] = RGB16(src16[11]);
-			dst16[11] = RGB16(src16[12]);
-			dst16[12] = RGB16(src16[13]);
-			dst16[13] = RGB16_AVG(&src16[14]);
-			dst16 += 14;
-			src16 += 16;
-		} while (--uCount);   //1 + 22 * 14 = 309, 320 - 309 = 11
-		{// 补齐末尾
-			dst16[ 0] = RGB16(src16[0]);
-			dst16[ 1] = RGB16(src16[1]);
-			dst16[ 2] = RGB16(src16[2]);
-			dst16[ 3] = RGB16(src16[3]);
-			dst16[ 4] = RGB16(src16[4]);
-			dst16[ 5] = RGB16(src16[5]);
-			dst16[ 6] = RGB16_AVG(&src16[6]);
-			dst16[ 7] = RGB16(src16[8]);
-			dst16[ 8] = RGB16(src16[9]);
-			dst16[ 9] = RGB16(src16[10]);
-			dst16[10] = RGB16(src16[11]);
+		u32 *dst32 = (u32 *)(void *)dst16;
+		if (gpu_unai_config_ext.pixel_skip) {
+			// Fast 32-bit paired writes + RGB16X2 + pref 0 (hoisted pixel_skip)
+			u32 prev = RGB16(src16[0]);
+			src16++;
+			do {
+#ifdef __mips__
+				__asm__ __volatile__("pref 0, 64(%0)" : : "r"(src16));
+#endif
+				u32 p0 = RGB16(src16[0]);
+				u32 p1 = RGB16(src16[1]);
+				u32 p2 = RGB16(src16[2]);
+				u32 p3 = RGB16(src16[3]);
+				u32 p4 = RGB16(src16[4]);
+				u32 p5 = RGB16(src16[5]);
+				u32 p6 = RGB16(src16[6]);
+				dst32[0] = prev | (p0 << 16);
+				dst32[1] = p1   | (p2 << 16);
+				dst32[2] = p3   | (p4 << 16);
+				dst32[3] = p5   | (p6 << 16);
+				u32 p7  = RGB16(src16[8]);
+				u32 p8  = RGB16(src16[9]);
+				u32 p9  = RGB16(src16[10]);
+				u32 p10 = RGB16(src16[11]);
+				u32 p11 = RGB16(src16[12]);
+				u32 p12 = RGB16(src16[13]);
+				prev    = RGB16(src16[14]);
+				dst32[4] = p7  | (p8  << 16);
+				dst32[5] = p9  | (p10 << 16);
+				dst32[6] = p11 | (p12 << 16);
+				dst32 += 7;
+				src16 += 16;
+			} while (--uCount);
+			// Tail (11 remaining pixels + prev = 6 u32 writes)
+			dst32[0] = prev            | ((u32)RGB16(src16[0])  << 16);
+			dst32[1] = RGB16(src16[1]) | ((u32)RGB16(src16[2])  << 16);
+			dst32[2] = RGB16(src16[3]) | ((u32)RGB16(src16[4])  << 16);
+			dst32[3] = RGB16(src16[5]) | ((u32)RGB16(src16[6])  << 16);
+			dst32[4] = RGB16(src16[8]) | ((u32)RGB16(src16[9])  << 16);
+			dst32[5] = RGB16(src16[10])| ((u32)RGB16(src16[11]) << 16);
+		} else {
+			u32 prev = RGB16(src16[0]);
+			src16++;
+			do {
+#ifdef __mips__
+				__asm__ __volatile__("pref 0, 64(%0)" : : "r"(src16));
+#endif
+				u32 p0 = RGB16(src16[0]);
+				u32 p1 = RGB16(src16[1]);
+				u32 p2 = RGB16(src16[2]);
+				u32 p3 = RGB16(src16[3]);
+				u32 p4 = RGB16(src16[4]);
+				u32 p5 = RGB16(src16[5]);
+				u32 p6 = RGB16_AVG(&src16[6]);
+				dst32[0] = prev | (p0 << 16);
+				dst32[1] = p1   | (p2 << 16);
+				dst32[2] = p3   | (p4 << 16);
+				dst32[3] = p5   | (p6 << 16);
+				u32 p7  = RGB16(src16[8]);
+				u32 p8  = RGB16(src16[9]);
+				u32 p9  = RGB16(src16[10]);
+				u32 p10 = RGB16(src16[11]);
+				u32 p11 = RGB16(src16[12]);
+				u32 p12 = RGB16(src16[13]);
+				prev    = RGB16_AVG(&src16[14]);
+				dst32[4] = p7  | (p8  << 16);
+				dst32[5] = p9  | (p10 << 16);
+				dst32[6] = p11 | (p12 << 16);
+				dst32 += 7;
+				src16 += 16;
+			} while (--uCount);
+			dst32[0] = prev            | ((u32)RGB16(src16[0])        << 16);
+			dst32[1] = RGB16(src16[1]) | ((u32)RGB16(src16[2])        << 16);
+			dst32[2] = RGB16(src16[3]) | ((u32)RGB16(src16[4])        << 16);
+			dst32[3] = RGB16(src16[5]) | ((u32)RGB16_AVG(&src16[6])   << 16);
+			dst32[4] = RGB16(src16[8]) | ((u32)RGB16(src16[9])        << 16);
+			dst32[5] = RGB16(src16[10])| ((u32)RGB16(src16[11])       << 16);
 		}
 		#endif
 #else
@@ -472,14 +527,19 @@ static inline void GPU_Blit256(const void* src, u16* dst16, bool isRGB24)
 		uCount = 32;
 		const u16* src16 = (const u16*) src;
 		do {
+#ifdef __mips__
+			__asm__ __volatile__("pref 0, 32(%0)" : : "r"(src16));
+#endif
+			u16 p1 = RGB16(src16[1]);
+			u16 p5 = RGB16(src16[5]);
 			dst16[ 0] = RGB16(src16[0]);
-			dst16[ 1] = RGB16(src16[1]);
-			dst16[ 2] = dst16[1];
+			dst16[ 1] = p1;
+			dst16[ 2] = p1;
 			dst16[ 3] = RGB16(src16[2]);
 			dst16[ 4] = RGB16(src16[3]);
 			dst16[ 5] = RGB16(src16[4]);
-			dst16[ 6] = RGB16(src16[5]);
-			dst16[ 7] = dst16[6];
+			dst16[ 6] = p5;
+			dst16[ 7] = p5;
 			dst16[ 8] = RGB16(src16[6]);
 			dst16[ 9] = RGB16(src16[7]);
 			dst16 += 10;

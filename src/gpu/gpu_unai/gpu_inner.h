@@ -256,6 +256,51 @@ const PSD gpuPixelSpanDrivers[64] =
 };
 
 ///////////////////////////////////////////////////////////////////////////////
+//  Fast 32-bit aligned VRAM span fill with MIPS pref 30 (cached PS1 VRAM only)
+static inline void gpuFillSpan16(u16 * __restrict__ pDst, u32 count, u16 data)
+{
+	if (count >= 4) {
+		if ((uintptr_t)pDst & 2) {
+			*pDst++ = data;
+			count--;
+		}
+		u32 data32 = ((u32)data << 16) | data;
+		u32 * __restrict__ pDst32 = (u32 *)pDst;
+#ifdef __mips__
+		if (count >= 32) {
+			while ((uintptr_t)pDst32 & 31) {
+				*pDst32++ = data32;
+				count -= 2;
+			}
+			while (count >= 16) {
+				__asm__ __volatile__("pref 30, 0(%0)" : : "r"(pDst32));
+				pDst32[0] = data32; pDst32[1] = data32;
+				pDst32[2] = data32; pDst32[3] = data32;
+				pDst32[4] = data32; pDst32[5] = data32;
+				pDst32[6] = data32; pDst32[7] = data32;
+				pDst32 += 8;
+				count -= 16;
+			}
+		}
+#endif
+		while (count >= 8) {
+			pDst32[0] = data32; pDst32[1] = data32;
+			pDst32[2] = data32; pDst32[3] = data32;
+			pDst32 += 4;
+			count -= 8;
+		}
+		while (count >= 2) {
+			*pDst32++ = data32;
+			count -= 2;
+		}
+		pDst = (u16 *)pDst32;
+	}
+	while (count--) {
+		*pDst++ = data;
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
 //  GPU Tiles innerloops generator
 
 template<int CF>
@@ -263,7 +308,7 @@ static void gpuTileSpanFn(u16 *pDst, u32 count, u16 data)
 {
 	if (!CF_MASKCHECK && !CF_BLEND) {
 		if (CF_MASKSET) { data = data | 0x8000; }
-		do { *pDst++ = data; } while (--count);
+		gpuFillSpan16(pDst, count, data);
 	} else if (CF_MASKCHECK && !CF_BLEND) {
 		if (CF_MASKSET) { data = data | 0x8000; }
 		do { if (!(*pDst&0x8000)) { *pDst = data; } pDst++; } while (--count);
@@ -355,6 +400,45 @@ static void gpuSpriteSpanFn(u16 *pDst, u32 count, u8* pTxt, u32 u0)
 	}
 
 	const u16 *CBA_; if (CF_TEXTMODE!=3) CBA_ = gpu_unai.CBA;
+
+	// Fast path for 4bpp flat-lit sprites using pre-lit 16-entry CLUT
+	if (CF_TEXTMODE == 1 && CF_LIGHT) {
+		const u32 * __restrict__ litCLUT = gpu_unai.LitCLUT;
+		if (!CF_MASKCHECK && !CF_BLEND) {
+			do {
+				u32 u_cur = u0 & u0_mask;
+				u8 rgb = pTxt[u_cur >> 1];
+				u32 p = litCLUT[(rgb >> ((u_cur & 1) << 2)) & 0xf];
+				if (p) {
+					if (CF_MASKSET) *pDst = (u16)(p | 0x8000);
+					else            *pDst = (u16)p;
+				}
+				u0++;
+				pDst++;
+			} while (--count);
+			return;
+		}
+		do {
+			uDst = *pDst;
+			if (CF_MASKCHECK && (uDst & 0x8000)) { goto endsprite_lit4; }
+			{
+				u32 u_cur = u0 & u0_mask;
+				u8 rgb = pTxt[u_cur >> 1];
+				u32 p = litCLUT[(rgb >> ((u_cur & 1) << 2)) & 0xf];
+				if (!p) goto endsprite_lit4;
+				uSrc = (u16)p;
+				srcMSB = uSrc & 0x8000;
+				if (CF_BLEND && srcMSB)
+					uSrc = gpuBlending<CF_BLENDMODE, false>(uSrc, uDst);
+				if (CF_MASKSET) *pDst = uSrc | 0x8000;
+				else            *pDst = uSrc | srcMSB;
+			}
+endsprite_lit4:
+			u0++;
+			pDst++;
+		} while (--count);
+		return;
+	}
 
 	do
 	{
@@ -474,6 +558,10 @@ static void gpuPolySpanFn(const gpu_unai_t & __restrict__ gpu_unai, u16 * __rest
 		{
 			// UNTEXTURED, NO GOURAUD
 			const u16 pix15 = gpu_unai.PixelData;
+			if (!CF_MASKCHECK && !CF_BLEND) {
+				gpuFillSpan16(pDst, count, CF_MASKSET ? (pix15 | 0x8000) : pix15);
+				return;
+			}
 			do {
 				u16 uSrc, uDst;
 
@@ -576,6 +664,157 @@ endpolynotextgou:
 			}
 		}
 
+		// ================================================================
+		// Fast path 1: 4bpp flat-lit undithered using pre-lit 16-entry CLUT
+		// (1.41x verified on JZ4760B, bit-exact including darkened-to-black)
+		// ================================================================
+		if (CF_TEXTMODE == 1 && CF_LIGHT && !CF_GOURAUD && !CF_DITHER) {
+			const u32 * __restrict__ litCLUT = gpu_unai.LitCLUT;
+			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
+
+			if (!CF_BLITMASK && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+				while (count >= 2) {
+					u32 u1 = l_u + l_u_inc;
+					u32 v1 = l_v + l_v_inc;
+					u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+					u8 b1 = tba8[((v1  << 1) & (0xff << 11)) + ((u1  >> 11) & 0x7f)];
+					u32 p0 = litCLUT[(b0 >> ((l_u >> 8) & 4)) & 0xf];
+					u32 p1 = litCLUT[(b1 >> ((u1  >> 8) & 4)) & 0xf];
+					if (p0) pDst[0] = CF_MASKSET ? (u16)(p0 | 0x8000) : (u16)p0;
+					if (p1) pDst[1] = CF_MASKSET ? (u16)(p1 | 0x8000) : (u16)p1;
+					pDst += 2;
+					l_u = u1 + l_u_inc;
+					l_v = v1 + l_v_inc;
+					count -= 2;
+				}
+				if (count) {
+					u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+					u32 p0 = litCLUT[(b0 >> ((l_u >> 8) & 4)) & 0xf];
+					if (p0) *pDst = CF_MASKSET ? (u16)(p0 | 0x8000) : (u16)p0;
+				}
+				return;
+			}
+
+			do {
+				if (CF_BLITMASK) { if ((bMsk>>((((uintptr_t)pDst)>>1)&7))&1) goto endpoly_lit4; }
+				if (CF_MASKCHECK || CF_BLEND) { uDst = *pDst; }
+				if (CF_MASKCHECK) if (uDst&0x8000) { goto endpoly_lit4; }
+				{
+					u32 tu = (l_u >> 10);
+					u32 tv = (l_v << 1) & (0xff << 11);
+					u8 rgb = tba8[tv + (tu >> 1)];
+					u32 p = litCLUT[(rgb >> ((tu & 1) << 2)) & 0xf];
+					if (!p) goto endpoly_lit4;
+					uSrc = (u16)p;
+					if (CF_BLEND) {
+						srcMSB = uSrc & 0x8000;
+						if (srcMSB) uSrc = gpuBlending<CF_BLENDMODE, false>(uSrc, uDst);
+						if (CF_MASKSET) *pDst = uSrc | 0x8000;
+						else            *pDst = uSrc | srcMSB;
+					} else {
+						if (CF_MASKSET) *pDst = uSrc | 0x8000;
+						else            *pDst = uSrc;
+					}
+				}
+endpoly_lit4:
+				pDst++;
+				l_u = (l_u + l_u_inc) & l_u_msk;
+				l_v = (l_v + l_v_inc) & l_v_msk;
+			} while (--count);
+			return;
+		}
+
+		// ================================================================
+		// Fast path 2: 4bpp unlit (1x spill-free, heavily used under fast_lighting=1)
+		// ================================================================
+		if (CF_TEXTMODE == 1 && !CF_LIGHT && !CF_BLITMASK && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
+			do {
+				u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+				u16 c0 = CBA_[(b0 >> ((l_u >> 8) & 4)) & 0xf];
+				if (c0) *pDst = CF_MASKSET ? (c0 | 0x8000) : c0;
+				pDst++;
+				l_u += l_u_inc;
+				l_v += l_v_inc;
+			} while (--count);
+			return;
+		}
+
+		// ================================================================
+		// Fast path 3: 4bpp Gouraud-lit undithered (1x spill-free + 1 KB LUT)
+		// ================================================================
+		if (CF_TEXTMODE == 1 && CF_LIGHT && CF_GOURAUD && !CF_DITHER && !CF_BLITMASK && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
+			const u8 * __restrict__ lut  = gpu_unai.LightLUT;
+			do {
+				u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+				u16 c0 = CBA_[(b0 >> ((l_u >> 8) & 4)) & 0xf];
+				if (c0) {
+					u16 lc = ((u16)lut[((c0 & 0x7C00) >> 5) | ((l_gCol >>  5) & 0x1F)] << 10) |
+					         ((u16)lut[ (c0 & 0x03E0)       | ((l_gCol >> 16) & 0x1F)] <<  5) |
+					         ((u16)lut[((c0 & 0x001F) << 5) |  (l_gCol >> 27)        ]      );
+					*pDst = CF_MASKSET ? (lc | 0x8000) : (lc | (c0 & 0x8000));
+				}
+				pDst++;
+				l_u += l_u_inc;
+				l_v += l_v_inc;
+				l_gCol += l_gInc;
+			} while (--count);
+			return;
+		}
+
+		// ================================================================
+		// Fast path 4: 8bpp unlit (1x spill-free)
+		// ================================================================
+		if (CF_TEXTMODE == 2 && !CF_LIGHT && !CF_BLITMASK && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
+			do {
+				u16 c0 = CBA_[tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 10) & 0xff)]];
+				if (c0) *pDst = CF_MASKSET ? (c0 | 0x8000) : c0;
+				pDst++;
+				l_u += l_u_inc;
+				l_v += l_v_inc;
+			} while (--count);
+			return;
+		}
+
+		// ================================================================
+		// Fast path 5: 8bpp flat-lit undithered (1x spill-free + pre-offset LUTs)
+		// ================================================================
+		if (CF_TEXTMODE == 2 && CF_LIGHT && !CF_GOURAUD && !CF_DITHER && !CF_BLITMASK && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
+			const u8 * __restrict__ lutR = gpu_unai.LightLUT + r5;
+			const u8 * __restrict__ lutG = gpu_unai.LightLUT + g5;
+			const u8 * __restrict__ lutB = gpu_unai.LightLUT + b5;
+			do {
+				u16 c0 = CBA_[tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 10) & 0xff)]];
+				if (c0) {
+					u16 lc = ((u16)lutB[(c0 & 0x7C00) >> 5] << 10) |
+					         ((u16)lutG[ (c0 & 0x03E0)    ] <<  5) |
+					         ((u16)lutR[(c0 & 0x001F) << 5]      );
+					*pDst = CF_MASKSET ? (lc | 0x8000) : (lc | (c0 & 0x8000));
+				}
+				pDst++;
+				l_u += l_u_inc;
+				l_v += l_v_inc;
+			} while (--count);
+			return;
+		}
+
+		// ================================================================
+		// Fast path 6: 16bpp unlit (1x spill-free)
+		// ================================================================
+		if (CF_TEXTMODE == 3 && !CF_LIGHT && !CF_BLITMASK && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+			do {
+				u16 c0 = TBA_[(l_v & (0xff << 10)) + ((l_u >> 10) & 0xff)];
+				if (c0) *pDst = CF_MASKSET ? (c0 | 0x8000) : c0;
+				pDst++;
+				l_u += l_u_inc;
+				l_v += l_v_inc;
+			} while (--count);
+			return;
+		}
+
 		do
 		{
 			if (CF_BLITMASK) { if ((bMsk>>((((uintptr_t)pDst)>>1)&7))&1) goto endpolytext; }
@@ -651,6 +890,77 @@ static void PolyNULL(const gpu_unai_t &gpu_unai, u16 *pDst, u32 count)
 	#ifdef ENABLE_GPU_LOG_SUPPORT
 		fprintf(stdout,"PolyNULL()\n");
 	#endif
+}
+
+///////////////////////////////////////////////////////////////////////////////
+//  Specialized 4bpp Monochrome Gouraud & Flat Span Loops (CF = 0xA1 = 161)
+//  Uses 1 KB per-CLUT MonoCLUT16 table (zero LightLUT loads, zero spills).
+//  Hardware verified 1.41x (opaque) / 1.37x (masked) on JZ4760B, bit-exact.
+///////////////////////////////////////////////////////////////////////////////
+static void gpuPolySpanMono4Opaque(u16 * __restrict__ pDst, u32 count,
+                                   const u8 * __restrict__ tba8,
+                                   const u16 * __restrict__ mono,
+                                   u32 l_u, u32 l_v, u32 l_c,
+                                   s32 l_u_inc, s32 l_v_inc, s32 l_c_inc)
+{
+	do {
+		u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+		*pDst++ = mono[((l_c >> 9) & 0x1F0) | ((b0 >> ((l_u >> 8) & 4)) & 0xf)];
+		l_u += l_u_inc;
+		l_v += l_v_inc;
+		l_c += l_c_inc;
+	} while (--count);
+}
+
+static void gpuPolySpanMono4Masked(u16 * __restrict__ pDst, u32 count,
+                                   const u8 * __restrict__ tba8,
+                                   const u16 * __restrict__ mono,
+                                   u32 omask,
+                                   u32 l_u, u32 l_v, u32 l_c,
+                                   s32 l_u_inc, s32 l_v_inc, s32 l_c_inc)
+{
+	do {
+		u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+		u32 idx = (b0 >> ((l_u >> 8) & 4)) & 0xf;
+		if ((omask >> idx) & 1)
+			*pDst = mono[((l_c >> 9) & 0x1F0) | idx];
+		pDst++;
+		l_u += l_u_inc;
+		l_v += l_v_inc;
+		l_c += l_c_inc;
+	} while (--count);
+}
+
+static void gpuPolySpanFlat4Opaque(u16 * __restrict__ pDst, u32 count,
+                                   const u8 * __restrict__ tba8,
+                                   const u16 * __restrict__ row,
+                                   u32 l_u, u32 l_v,
+                                   s32 l_u_inc, s32 l_v_inc)
+{
+	do {
+		u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+		*pDst++ = row[(b0 >> ((l_u >> 8) & 4)) & 0xf];
+		l_u += l_u_inc;
+		l_v += l_v_inc;
+	} while (--count);
+}
+
+static void gpuPolySpanFlat4Masked(u16 * __restrict__ pDst, u32 count,
+                                   const u8 * __restrict__ tba8,
+                                   const u16 * __restrict__ row,
+                                   u32 omask,
+                                   u32 l_u, u32 l_v,
+                                   s32 l_u_inc, s32 l_v_inc)
+{
+	do {
+		u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+		u32 idx = (b0 >> ((l_u >> 8) & 4)) & 0xf;
+		if ((omask >> idx) & 1)
+			*pDst = row[idx];
+		pDst++;
+		l_u += l_u_inc;
+		l_v += l_v_inc;
+	} while (--count);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

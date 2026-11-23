@@ -35,7 +35,9 @@ void video_set(unsigned short* pVideo,unsigned int width,unsigned int height);
 #endif
 void video_clear(void);
 void port_printf(int x, int y, const char *text);
+void port_printf_fg(int x, int y, const char *text, unsigned short fg);
 void port_printf_fg_bg(int x, int y, const char *text, int fg, int bg);
+void port_fill_rect(int x, int y, int w, int h, unsigned short color);
 
 extern unsigned short *SCREEN;
 

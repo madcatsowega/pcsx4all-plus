@@ -60,6 +60,11 @@ void gpuDrawS(PtrUnion packet, const PS gpuSpriteSpanDriver)
 	gpu_unai.g5 = packet.U1[1] >> 3;
 	gpu_unai.b5 = packet.U1[2] >> 3;
 
+	if ((gpu_unai.TEXT_MODE == (1 << 5)) && LightingEnabled() &&
+	    !(packet.U1[3] & 1) && ((packet.U4[0] & 0xF8F8F8) != 0x808080)) {
+		gpuBuildLitCLUT4();
+	}
+
 	u16 *Pixel = &((u16*)gpu_unai.vram)[FRAME_OFFSET(x0, y0)];
 	const int li=gpu_unai.ilace_mask;
 	const int pi=(ProgressiveInterlaceEnabled()?(gpu_unai.ilace_mask+1):0);

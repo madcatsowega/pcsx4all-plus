@@ -175,6 +175,83 @@ GPU_INLINE u16 gpuLightingTXT(u16 uSrc, u8 r5, u8 g5, u8 b5)
 	       (gpu_unai.LightLUT[((uSrc&0x001F)<<5) | r5]      );
 }
 
+// Pre-light all 16 entries of the active 4bpp CLUT once per flat-lit primitive.
+// Bit 16 (0x00010000) serves as an opaque sentinel so darkened-to-black texels
+// (lit color 0x0000 with raw CLUT != 0) are never mistaken for transparent (0).
+// Transparent entries (raw CLUT == 0) map to 0; bit 15 preserves STP/mask bit.
+GPU_INLINE void gpuBuildLitCLUT4(void)
+{
+	u32 * __restrict__ lit = gpu_unai.LitCLUT;
+	const u16 * __restrict__ cba = gpu_unai.CBA;
+	const u8 * __restrict__ lut = gpu_unai.LightLUT;
+	const u32 r5 = gpu_unai.r5;
+	const u32 g5 = gpu_unai.g5;
+	const u32 b5 = gpu_unai.b5;
+	for (int i = 0; i < 16; ++i) {
+		u16 c = cba[i];
+		if (!c) {
+			lit[i] = 0;
+		} else {
+			u32 lc = ((u32)lut[((c & 0x7C00) >> 5) | b5] << 10) |
+			         ((u32)lut[ (c & 0x03E0)       | g5] <<  5) |
+			         ((u32)lut[((c & 0x001F) << 5) | r5]      );
+			lit[i] = 0x00010000u | (c & 0x8000u) | lc;
+		}
+	}
+}
+
+static inline void gpuInvalidateMonoCLUTCache(void)
+{
+	for (int i = 0; i < 16; ++i)
+		gpu_unai.MonoCLUTCache[i].cba = NULL;
+}
+
+static inline void gpuBuildMonoCLUTRow(u16 * __restrict__ dst, const u16 * __restrict__ cba,
+                                       const u8 * __restrict__ lut, u32 L)
+{
+	const u8 * __restrict__ lutL = lut + L;
+	for (int i = 0; i < 16; ++i) {
+		u16 c = cba[i];
+		u16 lc = ((u16)lutL[(c & 0x7C00) >> 5] << 10) |
+		         ((u16)lutL[ (c & 0x03E0)    ] <<  5) |
+		         ((u16)lutL[(c & 0x001F) << 5]      );
+		dst[i] = (c & 0x8000u) | lc;
+	}
+}
+
+// Look up or initialize the cache slot for gpu_unai.CBA and ensure all
+// brightness rows in [L_lo..L_hi] (plus wrap guards at 0/31) are populated.
+static inline gpu_unai_t::MonoCLUTSlot* gpuPrepareMonoCLUT4(u32 L_min, u32 L_max)
+{
+	const u16 *cba = gpu_unai.CBA;
+	gpu_unai_t::MonoCLUTSlot *slot = &gpu_unai.MonoCLUTCache[((uintptr_t)cba >> 5) & 15];
+	if (slot->cba != cba) {
+		slot->cba = cba;
+		slot->valid_mask = 0;
+		u32 omask = 0;
+		for (int i = 0; i < 16; ++i) {
+			if (cba[i]) omask |= (1u << i);
+		}
+		slot->opaque_mask = (u16)omask;
+	}
+	u32 L_lo = (L_min > 0) ? (L_min - 1) : 0;
+	u32 L_hi = (L_max < 31) ? (L_max + 1) : 31;
+	u32 needed = ((2u << L_hi) - (1u << L_lo));
+	if (L_min == 0)  needed |= (1u << 31);
+	if (L_max == 31) needed |= 1u;
+	u32 missing = needed & ~slot->valid_mask;
+	if (missing) {
+		const u8 *lut = gpu_unai.LightLUT;
+		slot->valid_mask |= missing;
+		while (missing) {
+			u32 L = __builtin_ctz(missing);
+			gpuBuildMonoCLUTRow(slot->rows[L], cba, lut, L);
+			missing &= (missing - 1);
+		}
+	}
+	return slot;
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Apply fast (low-precision) 5-bit Gouraud lighting to bgr555 texture color:

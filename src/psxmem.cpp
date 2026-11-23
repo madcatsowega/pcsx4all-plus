@@ -68,6 +68,19 @@ bool psxH_allocated;
 u8 **psxMemWLUT;
 u8 **psxMemRLUT;
 
+// When MMAP_TO_ADDRESS_ZERO maps psxM at virtual address 0, mem_mapping.cpp
+// maps an identical MAP_SHARED mirror at 0x00200000. Using that non-NULL
+// mirror for LUT entries, memset/memcpy, and zlib I/O prevents NULL checks
+// (e.g. if (p != NULL) in psxMemRead/Write and gzread/gzwrite) from failing
+// on PS1 RAM page 0 while keeping PSX_MEM_VADDR == 0 for the MIPS dynarec.
+static inline s8 *psxM_nonnull(void)
+{
+#ifdef MMAP_TO_ADDRESS_ZERO
+	if (psxM == NULL) return (s8 *)(uintptr_t)0x200000;
+#endif
+	return psxM;
+}
+
 static u8 *psxNULLread;
 
 /*  Playstation Memory Map (from Playstation doc by Joshua Walker)
@@ -120,8 +133,9 @@ int psxMemInit()
 	}
 
 // MemR
+	s8 *m = psxM_nonnull();
 	for (i = 0; i< 0x10000; i++) psxMemRLUT[i]=psxNULLread;
-	for (i = 0; i < 0x80; i++) psxMemRLUT[i + 0x0000] = (u8 *)&psxM[(i & 0x1f) << 16];
+	for (i = 0; i < 0x80; i++) psxMemRLUT[i + 0x0000] = (u8 *)&m[(i & 0x1f) << 16];
 
 	memcpy(psxMemRLUT + 0x8000, psxMemRLUT, 0x80 * sizeof(void *));
 	memcpy(psxMemRLUT + 0xa000, psxMemRLUT, 0x80 * sizeof(void *));
@@ -135,7 +149,7 @@ int psxMemInit()
 	memcpy(psxMemRLUT + 0xbfc0, psxMemRLUT + 0x1fc0, 0x08 * sizeof(void *));
 
 // MemW
-	for (i = 0; i < 0x80; i++) psxMemWLUT[i + 0x0000] = (u8 *)&psxM[(i & 0x1f) << 16];
+	for (i = 0; i < 0x80; i++) psxMemWLUT[i + 0x0000] = (u8 *)&m[(i & 0x1f) << 16];
 	memcpy(psxMemWLUT + 0x8000, psxMemWLUT, 0x80 * sizeof(void *));
 	memcpy(psxMemWLUT + 0xa000, psxMemWLUT, 0x80 * sizeof(void *));
 
@@ -155,7 +169,7 @@ void psxMemReset()
 
 	memstats_reset();
 
-	memset(psxM, 0, 0x200000);
+	memset(psxM_nonnull(), 0, 0x200000);
 	memset(psxP, 0, 0x10000);
 	memset(psxR, 0, 0x80000);    // Bios memory
 
@@ -418,7 +432,7 @@ void psxMemWrite32_CacheCtrlPort(u32 value)
 			/* Cache is now isolated, pending cache-flush sequence:
 			 *  Backup lower 64KB of PS1 RAM, adjust psxMemRLUT[].
 			 */
-			memcpy((void*)mem_bak, (void*)psxM, sizeof(mem_bak));
+			memcpy((void*)mem_bak, (void*)psxM_nonnull(), sizeof(mem_bak));
 			psxMemRLUT[0x0000] = psxMemRLUT[0x0020] = psxMemRLUT[0x0040] = psxMemRLUT[0x0060] = (u8 *)mem_bak;
 			psxMemRLUT[0x8000] = psxMemRLUT[0x8020] = psxMemRLUT[0x8040] = psxMemRLUT[0x8060] = (u8 *)mem_bak;
 			psxMemRLUT[0xa000] = psxMemRLUT[0xa020] = psxMemRLUT[0xa040] = psxMemRLUT[0xa060] = (u8 *)mem_bak;
@@ -431,20 +445,23 @@ void psxMemWrite32_CacheCtrlPort(u32 value)
 			psxRegs.writeok = 1;
 			PSXMEM_LOG("%s(): Icache is unisolated.\n", __func__);
 
-			for (int i = 0; i < 0x80; i++)
-				psxMemWLUT[i + 0x0000] = (u8*)&psxM[(i & 0x1f) << 16];
-			memcpy(psxMemWLUT + 0x8000, psxMemWLUT, 0x80 * sizeof(void *));
-			memcpy(psxMemWLUT + 0xa000, psxMemWLUT, 0x80 * sizeof(void *));
+			{
+				s8 *m = psxM_nonnull();
+				for (int i = 0; i < 0x80; i++)
+					psxMemWLUT[i + 0x0000] = (u8*)&m[(i & 0x1f) << 16];
+				memcpy(psxMemWLUT + 0x8000, psxMemWLUT, 0x80 * sizeof(void *));
+				memcpy(psxMemWLUT + 0xa000, psxMemWLUT, 0x80 * sizeof(void *));
 
 #ifdef PSXREC
-			/* Cache is now unisolated:
-			 * Restore lower 64KB RAM contents and psxMemRLUT[].
-			 */
-			memcpy((void*)psxM, (void*)mem_bak, sizeof(mem_bak));
-			psxMemRLUT[0x0000] = psxMemRLUT[0x0020] = psxMemRLUT[0x0040] = psxMemRLUT[0x0060] = (u8 *)psxM;
-			psxMemRLUT[0x8000] = psxMemRLUT[0x8020] = psxMemRLUT[0x8040] = psxMemRLUT[0x8060] = (u8 *)psxM;
-			psxMemRLUT[0xa000] = psxMemRLUT[0xa020] = psxMemRLUT[0xa040] = psxMemRLUT[0xa060] = (u8 *)psxM;
+				/* Cache is now unisolated:
+				 * Restore lower 64KB RAM contents and psxMemRLUT[].
+				 */
+				memcpy((void*)m, (void*)mem_bak, sizeof(mem_bak));
+				psxMemRLUT[0x0000] = psxMemRLUT[0x0020] = psxMemRLUT[0x0040] = psxMemRLUT[0x0060] = (u8 *)m;
+				psxMemRLUT[0x8000] = psxMemRLUT[0x8020] = psxMemRLUT[0x8040] = psxMemRLUT[0x8060] = (u8 *)m;
+				psxMemRLUT[0xa000] = psxMemRLUT[0xa020] = psxMemRLUT[0xa040] = psxMemRLUT[0xa060] = (u8 *)m;
 #endif
+			}
 
 			/* Dynarecs might take this opportunity to flush their code cache */
 			psxCpu->Notify(R3000ACPU_NOTIFY_CACHE_UNISOLATED, NULL);

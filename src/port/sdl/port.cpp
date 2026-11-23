@@ -1,5 +1,8 @@
 #include <dirent.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <ucontext.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -57,6 +60,29 @@ unsigned short *SCREEN;
 
 static bool pcsx4all_initted = false;
 static bool emu_running = false;
+
+#ifdef __mips__
+static void pcsx4all_crash_handler(int sig, siginfo_t *si, void *uctx)
+{
+	ucontext_t *uc = (ucontext_t *)uctx;
+	unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
+	unsigned long ra = (unsigned long)uc->uc_mcontext.gregs[31];
+	unsigned long sp = (unsigned long)uc->uc_mcontext.gregs[29];
+	unsigned long addr = si ? (unsigned long)si->si_addr : 0;
+	char msg[256];
+	int n = snprintf(msg, sizeof(msg),
+		"CRASH sig=%d addr=0x%08lx pc=0x%08lx ra=0x%08lx sp=0x%08lx\n",
+		sig, addr, pc, ra, sp);
+	int fd = open("/home/retrofw/pcsx4all_crash.log",
+		O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0) {
+		if (write(fd, msg, n) < 0) {}
+		fsync(fd);
+		close(fd);
+	}
+	_exit(128 + sig);
+}
+#endif
 
 void config_load();
 void config_save();
@@ -1125,6 +1151,20 @@ int main (int argc, char **argv)
 	//NOTE: spu_pcsxrearmed will handle audio initialization
 	SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_NOPARACHUTE);
 
+#ifdef __mips__
+	{
+		struct sigaction sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_sigaction = pcsx4all_crash_handler;
+		sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+		sigaction(SIGSEGV, &sa, NULL);
+		sigaction(SIGBUS,  &sa, NULL);
+		sigaction(SIGILL,  &sa, NULL);
+		sigaction(SIGFPE,  &sa, NULL);
+		sigaction(SIGABRT, &sa, NULL);
+	}
+#endif
+
 	atexit(pcsx4all_exit);
 
 #ifdef SDL_TRIPLEBUF
@@ -1228,22 +1268,45 @@ void wait_ticks(unsigned s)
 #endif
 }
 
-void port_printf(int x, int y, const char *text)
+void port_fill_rect(int x, int y, int w, int h, unsigned short color)
+{
+	if (x < 0) { w += x; x = 0; }
+	if (y < 0) { h += y; y = 0; }
+	if (x + w > 320) w = 320 - x;
+	if (y + h > 240) h = 240 - y;
+	if (w <= 0 || h <= 0) return;
+	for (int row = 0; row < h; row++) {
+		unsigned short *dst = SCREEN + (y + row) * 320 + x;
+		for (int col = 0; col < w; col++) {
+			dst[col] = color;
+		}
+	}
+}
+
+void port_printf_fg(int x, int y, const char *text, unsigned short fg)
 {
 	unsigned short *screen = (SCREEN + x + y * 320);
-	for (int i = 0; i < strlen(text); i++) {
+	int len = (int)strlen(text);
+	for (int i = 0; i < len; i++) {
+		if (x + i * 8 + 8 > 320) break;
 		for (int l = 0; l < 8; l++) {
-			if (fontdata8x8[((text[i])*8)+l]&0x80) screen[l*320+0]=0xffff; //:0x0000;
-			if (fontdata8x8[((text[i])*8)+l]&0x40) screen[l*320+1]=0xffff; //:0x0000;
-			if (fontdata8x8[((text[i])*8)+l]&0x20) screen[l*320+2]=0xffff; //:0x0000;
-			if (fontdata8x8[((text[i])*8)+l]&0x10) screen[l*320+3]=0xffff; //:0x0000;
-			if (fontdata8x8[((text[i])*8)+l]&0x08) screen[l*320+4]=0xffff; //:0x0000;
-			if (fontdata8x8[((text[i])*8)+l]&0x04) screen[l*320+5]=0xffff; //:0x0000;
-			if (fontdata8x8[((text[i])*8)+l]&0x02) screen[l*320+6]=0xffff; //:0x0000;
-			if (fontdata8x8[((text[i])*8)+l]&0x01) screen[l*320+7]=0xffff; //:0x0000;
+			unsigned char bits = fontdata8x8[((unsigned char)text[i] * 8) + l];
+			if (bits & 0x80) screen[l*320+0] = fg;
+			if (bits & 0x40) screen[l*320+1] = fg;
+			if (bits & 0x20) screen[l*320+2] = fg;
+			if (bits & 0x10) screen[l*320+3] = fg;
+			if (bits & 0x08) screen[l*320+4] = fg;
+			if (bits & 0x04) screen[l*320+5] = fg;
+			if (bits & 0x02) screen[l*320+6] = fg;
+			if (bits & 0x01) screen[l*320+7] = fg;
 		}
 		screen += 8;
 	}
+}
+
+void port_printf(int x, int y, const char *text)
+{
+	port_printf_fg(x, y, text, 0xe73e); /* crisp MidnightMinimal ice-white */
 }
 
 void port_printf_fg_bg(int x, int y, const char *text, int fg, int bg)

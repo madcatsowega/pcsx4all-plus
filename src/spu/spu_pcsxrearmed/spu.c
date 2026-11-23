@@ -662,7 +662,7 @@ extern void mix_chan_mxu(int *SSumLR, const int *ChanBuf, int count, unsigned in
 extern void mix_chan_rvb_mxu(int *SSumLR, const int *ChanBuf, int count, unsigned int lv_rv, int *rvb);
 extern void finish_samples_mxu(int *SSumLR, short *pS, int ns_to);
 
-static int spu_use_mxu = 0;
+int spu_use_mxu = 0;
 
 static void spu_detect_and_enable_mxu(void)
 {

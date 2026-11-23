@@ -642,11 +642,21 @@ zlib_error:
 
 static int zlib_read(void *file, void *buf, u32 len)
 {
+#ifdef MMAP_TO_ADDRESS_ZERO
+	// When PSX RAM (psxM) is mapped at virtual address 0, redirect to the
+	// identical MAP_SHARED mirror at 0x00200000 so zlib never sees buf == NULL.
+	if (buf == NULL && len > 0)
+		buf = (void *)(uintptr_t)0x200000;
+#endif
 	return gzread((gzFile)file, buf, len);
 }
 
 static int zlib_write(void *file, const void *buf, u32 len)
 {
+#ifdef MMAP_TO_ADDRESS_ZERO
+	if (buf == NULL && len > 0)
+		buf = (const void *)(uintptr_t)0x200000;
+#endif
 	return gzwrite((gzFile)file, (void*)buf, len);
 }
 

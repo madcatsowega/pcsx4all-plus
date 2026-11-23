@@ -221,6 +221,10 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
   unsigned int *list_start = list;
   unsigned int *list_end = list + list_len;
 
+  // Invalidate cached pre-lit monochrome CLUT rows on each DMA batch entry
+  // so any prior GP0(0xA0) VRAM CLUT upload is guaranteed coherent.
+  gpuInvalidateMonoCLUTCache();
+
   //TODO: set ilace_mask when resolution changes instead of every time,
   // eliminate #ifdef below.
   gpu_unai.ilace_mask = gpu_unai.config.ilace_force;
@@ -239,11 +243,11 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
     }
 
     #define PRIM cmd
-    gpu_unai.PacketBuffer.U4[0] = list[0];
-    for (i = 1; i <= len; i++)
-      gpu_unai.PacketBuffer.U4[i] = list[i];
-
-    PtrUnion packet = { .ptr = (void*)&gpu_unai.PacketBuffer };
+    // Zero-copy packet view into command list for read-only commands
+    // (polygons, single lines, variable tiles/sprites, clears, moves, 0xEx).
+    // Mutating commands (line strips & fixed-size tiles/sprites) copy into
+    // gpu_unai.PacketBuffer below.
+    PtrUnion packet = { .ptr = (void*)list };
 
     switch (cmd)
     {
@@ -267,8 +271,8 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x25:
       case 0x26:
       case 0x27: {          // Textured 3-pt poly
-        gpuSetCLUT   (gpu_unai.PacketBuffer.U4[2] >> 16);
-        gpuSetTexture(gpu_unai.PacketBuffer.U4[4] >> 16);
+        gpuSetCLUT   (packet.U4[2] >> 16);
+        gpuSetTexture(packet.U4[4] >> 16);
 
         u32 driver_idx =
           (gpu_unai.blit_mask?1024:0) |
@@ -279,7 +283,7 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
         if (!FastLightingEnabled()) {
           driver_idx |= Lighting;
         } else {
-          if (!((gpu_unai.PacketBuffer.U1[0]>0x5F) && (gpu_unai.PacketBuffer.U1[1]>0x5F) && (gpu_unai.PacketBuffer.U1[2]>0x5F)))
+          if (!((packet.U1[0]>0x5F) && (packet.U1[1]>0x5F) && (packet.U1[2]>0x5F)))
             driver_idx |= Lighting;
         }
 
@@ -303,8 +307,8 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x2D:
       case 0x2E:
       case 0x2F: {          // Textured 4-pt poly
-        gpuSetCLUT   (gpu_unai.PacketBuffer.U4[2] >> 16);
-        gpuSetTexture(gpu_unai.PacketBuffer.U4[4] >> 16);
+        gpuSetCLUT   (packet.U4[2] >> 16);
+        gpuSetTexture(packet.U4[4] >> 16);
 
         u32 driver_idx =
           (gpu_unai.blit_mask?1024:0) |
@@ -315,7 +319,7 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
         if (!FastLightingEnabled()) {
           driver_idx |= Lighting;
         } else {
-          if (!((gpu_unai.PacketBuffer.U1[0]>0x5F) && (gpu_unai.PacketBuffer.U1[1]>0x5F) && (gpu_unai.PacketBuffer.U1[2]>0x5F)))
+          if (!((packet.U1[0]>0x5F) && (packet.U1[1]>0x5F) && (packet.U1[2]>0x5F)))
             driver_idx |= Lighting;
         }
 
@@ -344,8 +348,8 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x35:
       case 0x36:
       case 0x37: {          // Gouraud-shaded, textured 3-pt poly
-        gpuSetCLUT    (gpu_unai.PacketBuffer.U4[2] >> 16);
-        gpuSetTexture (gpu_unai.PacketBuffer.U4[5] >> 16);
+        gpuSetCLUT    (packet.U4[2] >> 16);
+        gpuSetTexture (packet.U4[5] >> 16);
         PP driver = gpuPolySpanDrivers[
           (gpu_unai.blit_mask?1024:0) |
           Dithering |
@@ -373,8 +377,8 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x3D:
       case 0x3E:
       case 0x3F: {          // Gouraud-shaded, textured 4-pt poly
-        gpuSetCLUT    (gpu_unai.PacketBuffer.U4[2] >> 16);
-        gpuSetTexture (gpu_unai.PacketBuffer.U4[5] >> 16);
+        gpuSetCLUT    (packet.U4[2] >> 16);
+        gpuSetTexture (packet.U4[5] >> 16);
         PP driver = gpuPolySpanDrivers[
           (gpu_unai.blit_mask?1024:0) |
           Dithering |
@@ -395,6 +399,8 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       } break;
 
       case 0x48 ... 0x4F: { // Monochrome line strip
+        for (i = 0; i <= len; i++) gpu_unai.PacketBuffer.U4[i] = list[i];
+        packet.ptr = (void*)&gpu_unai.PacketBuffer;
         u32 num_vertexes = 1;
         u32 *list_position = &(list[2]);
 
@@ -434,6 +440,8 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       } break;
 
       case 0x58 ... 0x5F: { // Gouraud-shaded line strip
+        for (i = 0; i <= len; i++) gpu_unai.PacketBuffer.U4[i] = list[i];
+        packet.ptr = (void*)&gpu_unai.PacketBuffer;
         u32 num_vertexes = 1;
         u32 *list_position = &(list[2]);
 
@@ -476,24 +484,11 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x65:
       case 0x66:
       case 0x67: {          // Textured rectangle (variable size)
-        gpuSetCLUT    (gpu_unai.PacketBuffer.U4[2] >> 16);
+        gpuSetCLUT    (packet.U4[2] >> 16);
         u32 driver_idx = Blending_Mode | gpu_unai.TEXT_MODE | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>1);
 
-        //senquack - Only color 808080h-878787h allows skipping lighting calculation:
-        // This fixes Silent Hill running animation on loading screens:
-        // (On PSX, color values 0x00-0x7F darken the source texture's color,
-        //  0x81-FF lighten textures (ultimately clamped to 0x1F),
-        //  0x80 leaves source texture color unchanged, HOWEVER,
-        //   gpu_unai uses a simple lighting LUT whereby only the upper
-        //   5 bits of an 8-bit color are used, so 0x80-0x87 all behave as
-        //   0x80.
-        // 
-        // NOTE: I've changed all textured sprite draw commands here and
-        //  elsewhere to use proper behavior, but left poly commands
-        //  alone, I don't want to slow rendering down too much. (TODO)
-        //if ((gpu_unai.PacketBuffer.U1[0]>0x5F) && (gpu_unai.PacketBuffer.U1[1]>0x5F) && (gpu_unai.PacketBuffer.U1[2]>0x5F))
         // Strip lower 3 bits of each color and determine if lighting should be used:
-        if ((gpu_unai.PacketBuffer.U4[0] & 0xF8F8F8) != 0x808080)
+        if ((packet.U4[0] & 0xF8F8F8) != 0x808080)
           driver_idx |= Lighting;
         PS driver = gpuSpriteSpanDrivers[driver_idx];
         gpuDrawS(packet, driver);
@@ -503,7 +498,10 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x69:
       case 0x6A:
       case 0x6B: {          // Monochrome rectangle (1x1 dot)
+        gpu_unai.PacketBuffer.U4[0] = list[0];
+        gpu_unai.PacketBuffer.U4[1] = list[1];
         gpu_unai.PacketBuffer.U4[2] = 0x00010001;
+        packet.ptr = (void*)&gpu_unai.PacketBuffer;
         PT driver = gpuTileSpanDrivers[(Blending_Mode | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>3)) >> 1];
         gpuDrawT(packet, driver);
       } break;
@@ -512,7 +510,10 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x71:
       case 0x72:
       case 0x73: {          // Monochrome rectangle (8x8)
+        gpu_unai.PacketBuffer.U4[0] = list[0];
+        gpu_unai.PacketBuffer.U4[1] = list[1];
         gpu_unai.PacketBuffer.U4[2] = 0x00080008;
+        packet.ptr = (void*)&gpu_unai.PacketBuffer;
         PT driver = gpuTileSpanDrivers[(Blending_Mode | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>3)) >> 1];
         gpuDrawT(packet, driver);
       } break;
@@ -521,12 +522,14 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x75:
       case 0x76:
       case 0x77: {          // Textured rectangle (8x8)
+        gpu_unai.PacketBuffer.U4[0] = list[0];
+        gpu_unai.PacketBuffer.U4[1] = list[1];
+        gpu_unai.PacketBuffer.U4[2] = list[2];
         gpu_unai.PacketBuffer.U4[3] = 0x00080008;
+        packet.ptr = (void*)&gpu_unai.PacketBuffer;
         gpuSetCLUT    (gpu_unai.PacketBuffer.U4[2] >> 16);
         u32 driver_idx = Blending_Mode | gpu_unai.TEXT_MODE | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>1);
 
-        //senquack - Only color 808080h-878787h allows skipping lighting calculation:
-        //if ((gpu_unai.PacketBuffer.U1[0]>0x5F) && (gpu_unai.PacketBuffer.U1[1]>0x5F) && (gpu_unai.PacketBuffer.U1[2]>0x5F))
         // Strip lower 3 bits of each color and determine if lighting should be used:
         if ((gpu_unai.PacketBuffer.U4[0] & 0xF8F8F8) != 0x808080)
           driver_idx |= Lighting;
@@ -538,7 +541,10 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x79:
       case 0x7A:
       case 0x7B: {          // Monochrome rectangle (16x16)
+        gpu_unai.PacketBuffer.U4[0] = list[0];
+        gpu_unai.PacketBuffer.U4[1] = list[1];
         gpu_unai.PacketBuffer.U4[2] = 0x00100010;
+        packet.ptr = (void*)&gpu_unai.PacketBuffer;
         PT driver = gpuTileSpanDrivers[(Blending_Mode | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>3)) >> 1];
         gpuDrawT(packet, driver);
       } break;
@@ -548,7 +554,7 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
 #ifdef __arm__
         if ((gpu_unai.GPU_GP1 & 0x180) == 0 && (gpu_unai.Masking | gpu_unai.PixelMSB) == 0)
         {
-          gpuSetCLUT    (gpu_unai.PacketBuffer.U4[2] >> 16);
+          gpuSetCLUT    (packet.U4[2] >> 16);
           gpuDrawS16(packet);
           break;
         }
@@ -556,11 +562,13 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
 #endif
       case 0x7E:
       case 0x7F: {          // Textured rectangle (16x16)
+        gpu_unai.PacketBuffer.U4[0] = list[0];
+        gpu_unai.PacketBuffer.U4[1] = list[1];
+        gpu_unai.PacketBuffer.U4[2] = list[2];
         gpu_unai.PacketBuffer.U4[3] = 0x00100010;
+        packet.ptr = (void*)&gpu_unai.PacketBuffer;
         gpuSetCLUT    (gpu_unai.PacketBuffer.U4[2] >> 16);
         u32 driver_idx = Blending_Mode | gpu_unai.TEXT_MODE | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>1);
-        //senquack - Only color 808080h-878787h allows skipping lighting calculation:
-        //if ((gpu_unai.PacketBuffer.U1[0]>0x5F) && (gpu_unai.PacketBuffer.U1[1]>0x5F) && (gpu_unai.PacketBuffer.U1[2]>0x5F))
         // Strip lower 3 bits of each color and determine if lighting should be used:
         if ((gpu_unai.PacketBuffer.U4[0] & 0xF8F8F8) != 0x808080)
           driver_idx |= Lighting;
@@ -591,7 +599,7 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
         goto breakloop;
 #endif
       case 0xE1 ... 0xE6: { // Draw settings
-        gpuGP0Cmd_0xEx(gpu_unai, gpu_unai.PacketBuffer.U4[0]);
+        gpuGP0Cmd_0xEx(gpu_unai, packet.U4[0]);
       } break;
     }
   }

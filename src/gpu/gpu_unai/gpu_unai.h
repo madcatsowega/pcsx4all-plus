@@ -193,6 +193,7 @@ struct gpu_unai_t {
 
 	u16* TBA;              // Ptr to current texture in VRAM
 	u16* CBA;              // Ptr to current CLUT in VRAM
+	u32  LitCLUT[16];      // Pre-lit 4bpp CLUT (bit 16 = opaque sentinel)
 
 	////////////////////////////////////////////////////////////////////////////
 	//  Inner Loop parameters
@@ -247,6 +248,17 @@ struct gpu_unai_t {
 
 	u8  LightLUT[32*32];    // 5-bit lighting LUT (gpu_inner_light.h)
 	u32 DitherMatrix[64];   // Matrix of dither coefficients
+
+	// 16-slot direct-mapped cache of pre-lit 4bpp monochrome CLUTs.
+	// Each row is 32 bytes = 1 JZ4760B L1 cache line, lazily populated per
+	// brightness level L in [0..31] and invalidated per command batch / VRAM write.
+	struct MonoCLUTSlot {
+		const u16 *cba;
+		u32 valid_mask;
+		u16 opaque_mask;
+		u16 pad;
+		u16 rows[32][16];
+	} __attribute__((aligned(32))) MonoCLUTCache[16];
 };
 
 static gpu_unai_t gpu_unai;

@@ -120,6 +120,19 @@ INLINE  fixed xInvMulx  (const fixed _a, const s32 _iFact, const s32 _iShift)
 	#endif
 }
 
+// Fast constant-shift inverse multiply for positive denominators in [2, 32767]
+// (avoids clz, sign branch, and variable 64-bit shift / __ashrdi3 on MIPS32).
+INLINE  fixed xInvMul21 (const fixed _a, const s32 _iFact)
+{
+	return fixed( ((s64)(_a)*(s64)(_iFact))>>21 );
+}
+
+INLINE  fixed xDivPosY  (const fixed _a, const s32 _dy)
+{
+	if (_dy > 1) return xInvMul21(_a, s_invTable[_dy]);
+	return (_dy == 1) ? i2x(_a) : 0;
+}
+
 INLINE  fixed xLoDivx   (const fixed _a, const fixed _b)
 {
   s32 iFact, iShift;

@@ -432,10 +432,11 @@ static int gui_Credits()
 		}
 
 		// diplay menu
-		int x = 8, y = 8;
-		port_printf(x, y, "pcsx4all 2.4: " __DATE__ " " __TIME__);
+		int x = 16, y = 10;
+		port_printf_fg(x, y, "PCSX4All+ 2.4", 0x5c7f);
+		port_printf_fg(156, y, __DATE__, 0x9558);
 
-		y += 18; port_printf(x, y, "pcsx team, pcsx-df team, pcsx-r team");
+		y = 44; port_printf(x, y, "pcsx team, pcsx-df team, pcsx-r team");
 
 		y += 14; port_printf(x, y, "Franxis and Chui: PCSX4ALL");
 
@@ -1860,33 +1861,73 @@ static void ShowMenuItem(int x, int y, MENUITEM *mi)
 	}
 }
 
+#if defined(RS97) && defined(SPU_PCSXREARMED)
+extern "C" int spu_use_mxu;
+#endif
+
 static void ShowMenu(MENU *menu)
 {
 	MENUITEM *mi = menu->m;
 
+	// MidnightMinimal cobalt highlight pill for active row
+	int sel_y = menu->y + menu->cur * 10;
+	port_fill_rect(16, sel_y - 1, 288, 10, 0x1969); /* deep cobalt #1A2D4D */
+	port_fill_rect(16, sel_y - 1, 3, 10, 0x5c7f);   /* bright cobalt #5E8CFF stripe */
+
 	// show menu lines
 	for(int i = 0; i < menu->num; i++, mi++) {
-		ShowMenuItem(menu->x, menu->y + i * 10, mi);
+		if (i == menu->cur && mi->name) {
+			static char string[PATH_MAX];
+			if (mi->showval) {
+				sprintf(string, "%s %s", mi->name, (*mi->showval)());
+				port_printf_fg(menu->x, menu->y + i * 10, string, 0xffff);
+			} else {
+				port_printf_fg(menu->x, menu->y + i * 10, mi->name, 0xffff);
+			}
+		} else {
+			ShowMenuItem(menu->x, menu->y + i * 10, mi);
+		}
 		// show hint if available
 		if (mi->hint && i == menu->cur)
 			mi->hint();
 	}
 
-	// show cursor
-	port_printf(menu->x - 3 * 8, menu->y + menu->cur * 10, ">>");
+	// show cobalt cursor chevron
+	port_printf_fg(menu->x - 3 * 8, sel_y, ">", 0x5c7f);
 
-	// general copyrights info
-	port_printf( (320 - 12 * 8) / 2, 10, "pcsx4all 2.4");
-	if (CdromId[0]) {
-		// add disc id display for confirming cheat filename
-		port_printf(2 * 8, 210, "CDID:");
-		port_printf(8 * 7.5, 210, CdromId);
+	// MidnightMinimal header bar: PCSX4All+ branding + live feature badge
+	port_printf_fg(12, 10, "PCSX4All+ 2.4", 0xffff);
+	{
+		char badge[32];
+		int has_mxu = 0;
+#if defined(RS97) && defined(SPU_PCSXREARMED)
+		has_mxu = spu_use_mxu;
+#endif
+		snprintf(badge, sizeof(badge), "%s%s%s",
+			has_mxu ? "MXU " : "",
+#ifdef MMAP_TO_ADDRESS_ZERO
+			"MMAP0 ",
+#else
+			"",
+#endif
+#ifdef HAVE_CHD
+			"CHD"
+#else
+			""
+#endif
+		);
+		int bx = 308 - (int)strlen(badge) * 8;
+		port_printf_fg(bx, 10, badge, has_mxu ? 0x5e74 : 0x84b5); /* emerald-cyan when MXU active */
 	}
 
-	port_printf(2 * 8, 220, "BIOS:");
-	port_printf(8 * 7.5, 220, bios_file_get());
+	if (CdromId[0]) {
+		// add disc id display for confirming cheat filename
+		port_printf_fg(14, 212, "CDID:", 0x7496);
+		port_printf_fg(58, 212, CdromId, 0xd6fc);
+	}
 
-	// port_printf( 4 * 8, 220, "Built on " __DATE__ " at " __TIME__);
+	port_printf_fg(14, 224, "BIOS:", 0x7496);
+	port_printf_fg(58, 224, bios_file_get(), 0xd6fc);
 }
 
 static int gui_RunMenu(MENU *menu)

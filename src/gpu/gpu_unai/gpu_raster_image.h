@@ -84,6 +84,7 @@ void gpuMoveImage(PtrUnion packet)
 
 	if( (x0==x1) && (y0==y1) ) return;
 	if ((w0<=0) || (h0<=0)) return;
+	gpuInvalidateMonoCLUTCache();
 	
 	#ifdef ENABLE_GPU_LOG_SUPPORT
 		fprintf(stdout,"gpuMoveImage(x0=%u,y0=%u,x1=%u,y1=%u,w0=%d,h0=%d)\n",x0,y0,x1,y1,w0,h0);
@@ -169,47 +170,18 @@ void gpuClearImage(PtrUnion packet)
 	if (h0 > FRAME_HEIGHT) h0 = FRAME_HEIGHT;
 	h0 -= y0;
 	if (h0 <= 0) return;
+	gpuInvalidateMonoCLUTCache();
 
 	#ifdef ENABLE_GPU_LOG_SUPPORT
 		fprintf(stdout,"gpuClearImage(x0=%d,y0=%d,w0=%d,h0=%d)\n",x0,y0,w0,h0);
 	#endif
 	
-	if (x0&1)
 	{
 		u16* pixel = (u16*)gpu_unai.vram + FRAME_OFFSET(x0, y0);
 		u16 rgb = GPU_RGB16(packet.U4[0]);
-		y0 = FRAME_WIDTH - w0;
 		do {
-			x0=w0;
-			do { *pixel++ = rgb; } while (--x0);
-			pixel += y0;
+			gpuFillSpan16(pixel, w0, rgb);
+			pixel += FRAME_WIDTH;
 		} while (--h0);
-	}
-	else
-	{
-		u32* pixel = (u32*)gpu_unai.vram + ((FRAME_OFFSET(x0, y0))>>1);
-		u32 rgb = GPU_RGB16(packet.U4[0]);
-		rgb |= (rgb<<16);
-		if (w0&1)
-		{
-			y0 = (FRAME_WIDTH - w0 +1)>>1;
-			w0>>=1;
-			do {
-				x0=w0;
-				do { *pixel++ = rgb; } while (--x0);
-				*((u16*)pixel) = (u16)rgb;
-				pixel += y0;
-			} while (--h0);
-		}
-		else
-		{
-			y0 = (FRAME_WIDTH - w0)>>1;
-			w0>>=1;
-			do {
-				x0=w0;
-				do { *pixel++ = rgb; } while (--x0);
-				pixel += y0;
-			} while (--h0);
-		}
 	}
 }
