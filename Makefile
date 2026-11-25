@@ -141,7 +141,9 @@ OBJS += obj/spu/spu_pcsxrearmed/dma.o obj/spu/spu_pcsxrearmed/freeze.o \
 	obj/spu/spu_pcsxrearmed/out.o obj/spu/spu_pcsxrearmed/nullsnd.o \
 	obj/spu/spu_pcsxrearmed/registers.o
 ifdef RS97
+CFLAGS += -I/home/sean/retrofw-aux/include -I/home/sean/retrofw-aux/lib
 OBJS += obj/spu/spu_pcsxrearmed/spu_mxu.o
+LDFLAGS += /home/sean/retrofw-aux/lib/libjzaux.a
 endif
 ifeq "$(ARCH)" "arm"
 OBJS += obj/spu/spu_pcsxrearmed/arm_utils.o

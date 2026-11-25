@@ -125,6 +125,30 @@ static noinline void decide_frameskip(void)
   }
 }
 
+static inline int rect_overlaps_display(int x0, int y0, int x1, int y1)
+{
+  int dx0 = gpu.screen.x;
+  int dy0 = gpu.screen.y;
+  int dw  = (gpu.screen.hres > 0) ? gpu.screen.hres : gpu.screen.w;
+  int dh  = (gpu.screen.h > 0) ? gpu.screen.h : gpu.screen.vres;
+  if (gpu.status.rgb24)
+    dw = (dw * 3 + 1) / 2;
+  if (dw <= 0 || dh <= 0 || dx0 + dw > 1024 || dy0 + dh > 512)
+    return 1;
+  return !(x1 <= dx0 || x0 >= dx0 + dw || y1 <= dy0 || y0 >= dy0 + dh);
+}
+
+static inline int draw_area_overlaps_display(void)
+{
+  int x0 = gpu.ex_regs[3] & 0x3ff;
+  int y0 = (gpu.ex_regs[3] >> 10) & 0x3ff;
+  int x1 = (gpu.ex_regs[4] & 0x3ff) + 1;
+  int y1 = ((gpu.ex_regs[4] >> 10) & 0x3ff) + 1;
+  if (x1 <= x0 || y1 <= y0)
+    return 0;
+  return rect_overlaps_display(x0, y0, x1, y1);
+}
+
 static noinline int decide_frameskip_allow(uint32_t cmd_e3)
 {
   // no frameskip if it decides to draw to display area,
@@ -268,10 +292,9 @@ void GPU_writeStatus(uint32_t data)
     gpu.regs[cmd] = data;
   }
 
-  gpu.state.fb_dirty = 1;
-
   switch (cmd) {
     case 0x00:
+      gpu.state.fb_dirty = 1;
       do_reset();
       break;
     case 0x01:
@@ -279,14 +302,20 @@ void GPU_writeStatus(uint32_t data)
       break;
     case 0x03:
       gpu.status.blanking = data & 1;
+      gpu.state.fb_dirty = 1;
       break;
     case 0x04:
       gpu.status.dma = data & 3;
       break;
-    case 0x05:
-      gpu.screen.x = data & 0x3ff;
-      gpu.screen.y = (data >> 10) & 0x1ff;
-      if (gpu.frameskip.set) {
+    case 0x05: {
+      int new_x = data & 0x3ff;
+      int new_y = (data >> 10) & 0x1ff;
+      int flipped = (new_x != gpu.screen.x || new_y != gpu.screen.y);
+      gpu.screen.x = new_x;
+      gpu.screen.y = new_y;
+      if (flipped)
+        gpu.state.fb_dirty = 1;
+      if (gpu.frameskip.set && (flipped || gpu.state.fb_dirty)) {
         decide_frameskip_allow(gpu.ex_regs[3]);
         if (gpu.frameskip.last_flip_frame != *gpu.state.frame_count) {
           decide_frameskip();
@@ -294,15 +323,18 @@ void GPU_writeStatus(uint32_t data)
         }
       }
       break;
+    }
     case 0x06:
       gpu.screen.x1 = data & 0xfff;
       gpu.screen.x2 = (data >> 12) & 0xfff;
       update_width();
+      gpu.state.fb_dirty = 1;
       break;
     case 0x07:
       gpu.screen.y1 = data & 0x3ff;
       gpu.screen.y2 = (data >> 10) & 0x3ff;
       update_height();
+      gpu.state.fb_dirty = 1;
       break;
     case 0x08:
       gpu.status.reg = (gpu.status.reg & ~0x7f0000) | ((data & 0x3F) << 17) | ((data & 0x40) << 10);
@@ -312,6 +344,7 @@ void GPU_writeStatus(uint32_t data)
       update_width();
       update_height();
       renderer_notify_res_change();
+      gpu.state.fb_dirty = 1;
       break;
     default:
       if ((cmd & 0xf0) == 0x10)
@@ -434,9 +467,14 @@ static void finish_vram_transfer(int is_read)
 {
   if (is_read)
     gpu.status.img = 0;
-  else
+  else {
     renderer_update_caches(gpu.dma_start.x, gpu.dma_start.y,
                            gpu.dma_start.w, gpu.dma_start.h);
+    if (rect_overlaps_display(gpu.dma_start.x, gpu.dma_start.y,
+                              gpu.dma_start.x + gpu.dma_start.w,
+                              gpu.dma_start.y + gpu.dma_start.h))
+      gpu.state.fb_dirty = 1;
+  }
 }
 
 static noinline int do_cmd_list_skip(uint32_t *data, int count, int *last_cmd)
@@ -538,8 +576,11 @@ static noinline int do_cmd_buffer(uint32_t *data, int count)
     if (gpu.frameskip.active && (gpu.frameskip.allow || ((data[pos] >> 24) & 0xf0) == 0xe0))
       pos += do_cmd_list_skip(data + pos, count - pos, &cmd);
     else {
+      int overlap_before = draw_area_overlaps_display();
+      int has_unclipped = (cmd == 0x02 || cmd == 0x80);
       pos += do_cmd_list(data + pos, count - pos, &cmd);
-      vram_dirty = 1;
+      if (has_unclipped || overlap_before || draw_area_overlaps_display())
+        vram_dirty = 1;
     }
 
     if (cmd == -1)

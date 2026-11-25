@@ -1124,6 +1124,10 @@ static const void * const worker = NULL;
 // here is the main job handler...
 ////////////////////////////////////////////////////////////////////////
 
+#ifdef RS97
+#include "spu_jzaux.c"
+#endif
+
 void do_samples(unsigned int cycles_to, int do_direct)
 {
  unsigned int silentch;
@@ -1143,6 +1147,14 @@ void do_samples(unsigned int cycles_to, int do_direct)
  do_direct |= (silentch == 0xffffff);
  if (worker != NULL)
   sync_worker_thread(do_direct);
+#ifdef RS97
+ if (g_aux_active) {
+  if (do_direct || (spu.rvb->dirty && spu.rvb->StartAddr))
+   spu_jzaux_flush();
+  else
+   spu_jzaux_reap_ready();
+ }
+#endif
 
  if (cycle_diff < 2 * 768)
   return;
@@ -1186,6 +1198,23 @@ void do_samples(unsigned int cycles_to, int do_direct)
   if (unlikely(spu.rvb->dirty))
    REVERBPrep();
 
+#ifdef RS97
+  if (g_aux_active && !do_direct && worker == NULL) {
+   int rem = ns_to;
+   int saved_decode_pos = spu.decode_pos;
+   while (rem > 0) {
+    int slice = (rem > AUX_SPU_MAX_NS) ? AUX_SPU_MAX_NS : rem;
+    if (!spu_jzaux_queue_slice(slice, silentch)) {
+     spu_jzaux_flush();
+     do_channels(slice);
+     do_samples_finish(spu.SSumLR, slice, silentch, spu.decode_pos);
+    }
+    spu.decode_pos = (spu.decode_pos + slice) & 0x1ff;
+    rem -= slice;
+   }
+   spu.decode_pos = saved_decode_pos;
+  } else
+#endif
   if (do_direct || worker == NULL || !spu_config.iUseThread) {
    do_channels(ns_to);
    do_samples_finish(spu.SSumLR, ns_to, silentch, spu.decode_pos);
@@ -1297,7 +1326,11 @@ void schedule_next_irq(void)
 
 void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)
 {
+#ifdef RS97
+ do_samples(cycle, g_aux_active ? 0 : spu_config.iUseFixedUpdates);
+#else
  do_samples(cycle, spu_config.iUseFixedUpdates);
+#endif
 
  if (spu.spuCtrl & CTRL_IRQ)
   schedule_next_irq();
@@ -1347,6 +1380,9 @@ int CALLBACK SPUplayCDDAchannel(short *pcm, int nbytes)
 // to be called after state load
 void ClearWorkingState(void)
 {
+#ifdef RS97
+ spu_jzaux_flush();
+#endif
  memset(iFMod, 0, sizeof(iFMod));
  spu.pS=(short *)spu.pSpuBuffer;                       // setup soundbuffer pointer
 }
@@ -1554,6 +1590,7 @@ long CALLBACK SPUinit(void)
  spu.bSpuInit=1;                                       // flag: we are inited
 #ifdef RS97
  spu_detect_and_enable_mxu();
+ spu_jzaux_init();
 #endif
 
  return 0;
@@ -1588,6 +1625,9 @@ long CALLBACK SPUshutdown(void)
 {
  SPUclose();
 
+#ifdef RS97
+ spu_jzaux_shutdown();
+#endif
  exit_spu_thread();
 
  free(spu.spuMemC);

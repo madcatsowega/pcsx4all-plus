@@ -68,11 +68,19 @@ static void pcsx4all_crash_handler(int sig, siginfo_t *si, void *uctx)
 	unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
 	unsigned long ra = (unsigned long)uc->uc_mcontext.gregs[31];
 	unsigned long sp = (unsigned long)uc->uc_mcontext.gregs[29];
+	unsigned long v0 = (unsigned long)uc->uc_mcontext.gregs[2];
+	unsigned long v1 = (unsigned long)uc->uc_mcontext.gregs[3];
+	unsigned long a0 = (unsigned long)uc->uc_mcontext.gregs[4];
+	unsigned long a1 = (unsigned long)uc->uc_mcontext.gregs[5];
+	unsigned long a2 = (unsigned long)uc->uc_mcontext.gregs[6];
+	unsigned long a3 = (unsigned long)uc->uc_mcontext.gregs[7];
 	unsigned long addr = si ? (unsigned long)si->si_addr : 0;
-	char msg[256];
+	int si_code = si ? si->si_code : -1;
+	char msg[512];
 	int n = snprintf(msg, sizeof(msg),
-		"CRASH sig=%d addr=0x%08lx pc=0x%08lx ra=0x%08lx sp=0x%08lx\n",
-		sig, addr, pc, ra, sp);
+		"CRASH sig=%d code=%d addr=0x%08lx pc=0x%08lx ra=0x%08lx sp=0x%08lx\n"
+		"  v0=0x%08lx v1=0x%08lx a0=0x%08lx a1=0x%08lx a2=0x%08lx a3=0x%08lx\n",
+		sig, si_code, addr, pc, ra, sp, v0, v1, a0, a1, a2, a3);
 	int fd = open("/home/retrofw/pcsx4all_crash.log",
 		O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (fd >= 0) {

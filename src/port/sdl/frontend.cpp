@@ -1771,8 +1771,14 @@ static int spu_settings_defaults()
 	Config.ForcedXAUpdates = FORCED_XA_UPDATES_DEFAULT;
 	Config.SpuIrq = 0;
 #ifdef SPU_PCSXREARMED
+#ifdef RS97
+	/* 339 MHz AUX+MXU coprocessor handles full Gaussian + Reverb with near-zero main CPU cost */
+	spu_config.iUseInterpolation = 2;
+	spu_config.iUseReverb = 1;
+#else
 	spu_config.iUseInterpolation = 0;
 	spu_config.iUseReverb = 0;
+#endif
 	spu_config.iVolume = 1024;
 #endif
 	return 0;
