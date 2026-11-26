@@ -759,8 +759,39 @@ static inline int aux_build_dl_batch(unsigned int *list, int list_len,
     if (cur + 1 + len > end)
       break;
 
-    /* Break batch before VRAM I/O, MoveImage, ClearImage, or DrawArea changes */
-    if (cmd == 0x02 || cmd == 0x80 || cmd == 0xA0 || cmd == 0xC0 || cmd == 0xE3 || cmd == 0xE4)
+    /* Skip 0x00 (NOP) and 0x01 (Clear Cache) cleanly without breaking batch! (Fixes Spyro!) */
+    if (cmd == 0x00 || cmd == 0x01) {
+      cur += 1 + len;
+      continue;
+    }
+
+    /* Include framebuffer 0x02 (ClearImage) inside the async AUX batch! */
+    if (cmd == 0x02) {
+      s32 cx0 = (s32)(cur[1] & 0x3F0U);
+      s32 cw  = (s32)(((cur[2] & 0x3FFU) + 0xFU) & ~0xFU);
+      s32 cx1 = cx0 + cw;
+      if (cx0 < gpu_unai.DrawingArea[0] || cx1 > gpu_unai.DrawingArea[2])
+        break; /* Offscreen VRAM clear: let Core 0 handle outside batch */
+      s32 y0 = (s32)((cur[1] >> 16) & 0x1FFU);
+      s32 h  = (s32)((cur[2] >> 16) & 0x1FFU);
+      s32 y1 = y0 + h;
+      if (y1 > y_split && y0 < band_y1 && h > 0) {
+        if (dl_w + 2U + 3U + 2U >= dl_cap) break;
+        s32 ymin = (y0 < 0) ? 0 : y0;
+        s32 ymax = (y1 > 511) ? 511 : y1;
+        dl[dl_w++] = 0x80000000U | (3U << 16) | 0x02U;
+        dl[dl_w++] = ((u32)ymin << 16) | (u32)ymax;
+        dl[dl_w++] = cur[0];
+        dl[dl_w++] = cur[1];
+        dl[dl_w++] = cur[2];
+        aux_prims++;
+      }
+      cur += 1 + len;
+      continue;
+    }
+
+    /* Break batch before VRAM I/O, MoveImage, or DrawArea changes */
+    if (cmd == 0x80 || cmd == 0xA0 || cmd == 0xC0 || cmd == 0xE3 || cmd == 0xE4)
       break;
 
     if (cmd >= 0xE1 && cmd <= 0xE6) {
@@ -1064,7 +1095,7 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       int dw = dx1 - dx0, dh = dy1 - dy0;
 
       if (rem >= 24 && dw >= 64 && dw <= 640 && dh >= 64 &&
-          cmd0 != 0x02 && cmd0 != 0x80 && cmd0 != 0xA0 && cmd0 != 0xC0 &&
+          cmd0 != 0x80 && cmd0 != 0xA0 && cmd0 != 0xC0 &&
           cmd0 != 0xE3 && cmd0 != 0xE4) {
         uint32_t dl_cap = 0;
         uint32_t *dl = pcsx_aux_gpu_dl_ptr(&dl_cap);
@@ -1078,6 +1109,7 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
           p.strip_x0     = (uint16_t)(dx0 & ~1);
           p.strip_x1     = (uint16_t)((dx1 + 1) & ~1);
           if (p.strip_x1 > 1024U) p.strip_x1 = 1024U;
+          if (p.strip_x1 - p.strip_x0 > 640U) p.strip_x1 = p.strip_x0 + 640U;
           p.band_y0      = (uint16_t)y_split;
           p.band_y1      = (uint16_t)dy1;
           p.init_gp1     = gpu_unai.GPU_GP1;
@@ -1097,11 +1129,43 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
             aux_gpu_verify_batch(cur, consumed, &p);
 
           if (pcsx_aux_gpu_submit(&p)) {
-            /* Main CPU renders top [dy0 .. y_split) IN PARALLEL with AUX rendering [y_split .. dy1)! */
+            /* Main CPU renders top [dy0 .. y_split) IN PARALLEL with AUX rendering [y_split .. dy1)!
+             * Note: if y_split == dy0 (0% Main / 100% AUX), DrawingArea[3]=dy0 clips every prim in ~5
+             * cycles while still keeping GP0 state (0xE1..E6, tpage, CLUT) 100% in sync!
+             * Also clip ClearImage (0x02) on Main CPU to top [0..y_split) so it never touches AUX's band! */
             u16 orig_y1 = gpu_unai.DrawingArea[3];
             gpu_unai.DrawingArea[3] = (u16)y_split;
             int sub_last = 0;
-            do_cmd_list_sw(cur, consumed, &sub_last);
+            unsigned int *sc = cur, *se = cur + consumed;
+            while (sc < se) {
+              u32 scmd = *sc >> 24;
+              if (scmd == 0x02) {
+                /* Clip ClearImage height to strictly above y_split on Core 0 (AUX clears >= y_split) */
+                s32 cy0 = (s32)((sc[1] >> 16) & 0x1FFU);
+                s32 ch  = (s32)((sc[2] >> 16) & 0x1FFU);
+                if (cy0 < y_split && ch > 0) {
+                  s32 cy1 = cy0 + ch;
+                  if (cy1 > y_split) cy1 = y_split;
+                  u32 tmp_clr[3] = { sc[0], sc[1], (sc[2] & 0xFFFFU) | ((u32)(cy1 - cy0) << 16) };
+                  do_cmd_list_sw(tmp_clr, 3, &sub_last);
+                }
+                sc += 3;
+              } else {
+                /* Run contiguous non-0x02 chunk through do_cmd_list_sw */
+                unsigned int *run_end = sc;
+                while (run_end < se) {
+                  u32 rc = *run_end >> 24;
+                  if (rc == 0x02) break;
+                  u32 rl = cmd_lengths[rc];
+                  if (run_end + 1 + rl > se) break;
+                  run_end += 1 + rl;
+                }
+                int rlen = (int)(run_end - sc);
+                if (rlen <= 0) break;
+                do_cmd_list_sw(sc, rlen, &sub_last);
+                sc += rlen;
+              }
+            }
             gpu_unai.DrawingArea[3] = orig_y1;
             cur += consumed;
             *last_cmd = sub_last;
@@ -1110,7 +1174,7 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
         }
       }
 
-      /* Unsplit single command (e.g. 0x02 ClearImage, 0x80 MoveImage, 0xE3/E4, or tiny tail) */
+      /* Unsplit single command (e.g. 0x80 MoveImage, 0xE3/E4, or tiny tail) */
       u32 len = cmd_lengths[cmd0];
       if (cur + 1 + len > end) {
         *last_cmd = -1;
@@ -1120,8 +1184,9 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
         *last_cmd = (int)cmd0;
         return (int)(cur - list);
       }
-      /* Flush in-flight AUX GPU before any unsplit draw/clear/move that could touch bottom half */
-      if (cmd0 != 0xE1 && cmd0 != 0xE2 && cmd0 != 0xE5 && cmd0 != 0xE6)
+      /* Flush in-flight AUX GPU only before commands that could touch AUX's active band */
+      if (cmd0 != 0x00 && cmd0 != 0x01 &&
+          cmd0 != 0xE1 && cmd0 != 0xE2 && cmd0 != 0xE3 && cmd0 != 0xE4 && cmd0 != 0xE5 && cmd0 != 0xE6)
         pcsx_aux_gpu_flush();
 
       /* Handle line strips by passing remaining tail to SW */
@@ -1140,8 +1205,21 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
     }
     return (int)(cur - list);
   }
-  /* Small non-splittable call: ensure any prior AUX GPU batch is flushed before Main CPU draws */
-  pcsx_aux_gpu_flush();
+  /* Small non-splittable call: skip flushing AUX if it only contains state/NOP commands! */
+  {
+    int needs_flush = 0;
+    for (int i = 0; i < list_len; ) {
+      u32 c = list[i] >> 24;
+      u32 l = cmd_lengths[c];
+      if (c != 0x00 && c != 0x01 && (c < 0xE1 || c > 0xE6)) {
+        needs_flush = 1;
+        break;
+      }
+      i += 1 + (int)l;
+    }
+    if (needs_flush)
+      pcsx_aux_gpu_flush();
+  }
 #endif
   return do_cmd_list_sw(list, list_len, last_cmd);
 }

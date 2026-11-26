@@ -698,8 +698,12 @@ long GPU_dmaChain(uint32_t *rambase, uint32_t start_addr)
       if (use_flat) {
         if (flat_len + (uint32_t)len > 32768U) {
           left = do_cmd_buffer(chain_flat, (int)flat_len);
-          if (left) log_anomaly("GPUdmaChain: discarded %d/%u words\n", left, flat_len);
-          flat_len = 0;
+          if (left > 0 && (uint32_t)left < flat_len) {
+            memmove(chain_flat, chain_flat + flat_len - (uint32_t)left, (size_t)left * 4U);
+            flat_len = (uint32_t)left;
+          } else {
+            flat_len = 0;
+          }
         }
         uint32_t first_cmd = list[1] >> 24;
         if (first_cmd >= 0xa0 && first_cmd <= 0xdf) {
@@ -711,9 +715,12 @@ long GPU_dmaChain(uint32_t *rambase, uint32_t start_addr)
           left = do_cmd_buffer(list + 1, len);
           if (left) log_anomaly("GPUdmaChain: discarded %d/%d words\n", left, len);
           if (gpu.dma.h) use_flat = 0;
-        } else {
+        } else if (flat_len + (uint32_t)len <= 32768U) {
           memcpy(&chain_flat[flat_len], list + 1, (size_t)len * 4U);
           flat_len += (uint32_t)len;
+        } else {
+          left = do_cmd_buffer(list + 1, len);
+          if (left) log_anomaly("GPUdmaChain: discarded %d/%d words\n", left, len);
         }
       } else
 #endif
@@ -840,10 +847,10 @@ void GPU_updateLace(void)
 {
   if (gpu.cmd_len > 0)
     flush_cmd_buffer();
-  renderer_flush_queues();
 
   if (gpu.status.blanking) {
     if (!gpu.state.blanked) {
+      renderer_flush_queues();
       vout_blank();
       gpu.state.blanked = 1;
       gpu.state.fb_dirty = 1;
@@ -862,6 +869,15 @@ void GPU_updateLace(void)
     }
     gpu.frameskip.frame_ready = 0;
   }
+
+#ifdef RS97
+  /* Only wait on AUX GPU if the displayed buffer actually overlaps AUX's active band!
+   * Double-buffered games displaying Buffer A while AUX draws Buffer B incur ZERO stall! */
+  pcsx_aux_gpu_flush_rect(gpu.screen.x, gpu.screen.y,
+                          gpu.screen.x + gpu.screen.w, gpu.screen.y + gpu.screen.h);
+#else
+  renderer_flush_queues();
+#endif
 
   uint64_t _vt0 = unlikely(g_pcsx_prof.enabled) ? pcsx_prof_now_us() : 0;
   vout_update();

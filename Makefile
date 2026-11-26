@@ -41,7 +41,7 @@ ifeq ($(PGO),generate)
 OPTS += -fprofile-generate -fprofile-dir=$(PGO_GEN_DIR)
 endif
 ifeq ($(PGO),use)
-OPTS += -fprofile-use -fprofile-dir=$(PGO_USE_DIR) -fprofile-correction -Wno-missing-profile -Wno-error=coverage-mismatch
+OPTS += -fprofile-use -fprofile-dir=$(PGO_USE_DIR) -fprofile-correction -fno-reorder-blocks-and-partition -Wno-missing-profile -Wno-error=coverage-mismatch
 endif
 
 CFLAGS = $(C_ARCH) -fno-common -fdata-sections -ffunction-sections $(OPTS) -DGCW_ZERO \

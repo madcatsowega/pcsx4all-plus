@@ -146,9 +146,11 @@ void pcsx_prof_frame_tick(void)
 #include <libjzaux.h>
 #include "/home/sean/retrofw-aux/firmware/pcsx_hybrid_proto.h"
 #include "/home/sean/retrofw-aux/firmware/aux_pcsx_hybrid_fw.h"
+#include "gauss_i.h"
 
-#define AUX_DMA_VRAM_SIZE  (2U * 1024U * 1024U) /* 4KB front guard + 1MB VRAM + 1020KB tail guard */
-#define AUX_DMA_DL_SIZE    (512U * 1024U)       /* 512 KB display list (131,072 u32 words) */
+#define AUX_DMA_VRAM_SIZE  (2U * 1024U * 1024U) /* 8KB front guard + 1MB VRAM + 1016KB tail guard */
+#define AUX_DMA_DL_SIZE    (512U * 1024U)       /* 2 x 256 KB ping-pong display lists! */
+#define AUX_DMA_DL_HALF    (256U * 1024U)       /* 65,536 u32 words per half */
 
 struct mdec_pending_slot {
 	uint8_t *dst;
@@ -159,32 +161,35 @@ static jz_aux_ctx_t *g_aux_ctx = NULL;
 static volatile struct aux_hybrid_sram *g_aux_sram = NULL;
 static volatile union aux_hybrid_slot *g_aux_slot0 = NULL;
 
-/* Contiguous cached DDR2 buffers: 2 MB PS1 VRAM (slot 0) + 512 KB GPU display list (slot 1) */
+/* Contiguous cached DDR2 buffers: 2 MB PS1 VRAM (slot 0) + 2x256 KB GPU DL (slot 1) */
 static jz_aux_dma_buf_t g_aux_vram_dma;
 static jz_aux_dma_buf_t g_aux_dl_dma;
 static int      g_aux_dma_ok = 0;
 static uint32_t g_vram_dma_off = 4096U;
 static uint32_t g_vram_phys = 0;
 static uint32_t g_dl_phys = 0;
+static uint32_t g_dl_idx = 0; /* Ping-pong 0/1 so Core 0 NEVER overwrites AUX's active DL! */
 
-/* 4-entry FIFO tracking:
- *   - SPU uses 2 x 8 KB ping-pong slots inside TCSM0 (g_spu_busy[0..1], g_spu_next)
- *   - MDEC uses full 16 KB TCSM0 (drains SPU slots before launch)
- *   - GPU uses dedicated TCSM1+0x5000 + sram->gpu_job (g_gpu_inflight)
- */
-static uint32_t g_submit_seq = 0;
-static uint32_t g_reap_seq = 0;
-static uint32_t g_fifo_owner[4] = { AUX_CMD_NONE, AUX_CMD_NONE, AUX_CMD_NONE, AUX_CMD_NONE };
+/* Independent SPU/MDEC ring (TCSM0: 2 x 8KB SPU ping-pong OR 16KB MDEC) */
+static uint32_t g_spu_submit = 0;
+static uint32_t g_spu_reap = 0;
+static uint32_t g_spu_owner[2] = { AUX_CMD_NONE, AUX_CMD_NONE };
 static int      g_spu_busy[2] = { 0, 0 };
 static uint32_t g_spu_next = 0;
 static int      g_mdec_inflight = 0;
+static struct mdec_pending_slot g_mdec_pend;
+
+/* Independent GPU doorbell (TCSM1+0x5000 DMAGP1 arena) */
+static uint32_t g_gpu_submit = 0;
+static uint32_t g_gpu_reap = 0;
 static int      g_gpu_inflight = 0;
 static uint32_t g_gpu_sync_off = 0;
 static uint32_t g_gpu_sync_len = 0;
-static struct mdec_pending_slot g_mdec_pend;
+static int      g_gpu_x0 = 0, g_gpu_y0 = 0, g_gpu_x1 = 0, g_gpu_y1 = 0;
 static int      g_aux_active = 0;
 
-static int      g_gpu_split_pct = 72;
+static int      g_gpu_enabled = 1;
+static int      g_gpu_split_pct = 60;
 static int      g_gpu_split_pinned = 0;
 static uint32_t g_gpu_tune_jobs = 0;
 static uint32_t g_gpu_tune_waits = 0;
@@ -209,10 +214,14 @@ static void check_gpu_env(void)
 	if (sp) {
 		int v = atoi(sp);
 		g_gpu_split_pinned = 1;
-		if (v <= 0) g_gpu_split_pct = 0;
-		else if (v < 20) g_gpu_split_pct = 20;
-		else if (v > 90) g_gpu_split_pct = 90;
-		else g_gpu_split_pct = v;
+		if (v <= 0) {
+			g_gpu_enabled = 0;
+			g_gpu_split_pct = 0;
+		} else {
+			g_gpu_enabled = 1;
+			if (v > 90) v = 90;
+			g_gpu_split_pct = v;
+		}
 	}
 	const char *vf = getenv("PCSX_AUX_GPU_VERIFY");
 	if (vf && atoi(vf) > 0)
@@ -256,39 +265,44 @@ static void copy_to_tcsm_u16(volatile uint16_t *dst, const uint16_t *src, uint32
 	for (uint32_t i = 0; i < nwords; i++) dst[i] = src[i];
 }
 
-static void pcsx_aux_reap_one(void)
+static void pcsx_aux_disable_timeout(const char *kind, uint32_t done, uint32_t want)
 {
-	uint32_t seq = g_reap_seq;
-	uint32_t fidx = seq & 3U;
+	printf("[pcsx-aux] WARNING: Hybrid v4 AUX %s timeout (done=%u want=%u), disabling AUX!\n",
+	       kind, done, want);
+	FILE *lf = fopen("/tmp/pcsx_aux.log", "a");
+	if (lf) {
+		fprintf(lf, "TIMEOUT %s done=%u want=%u spu=%u mdec=%u gpu=%u\n",
+		        kind, done, want, g_prof_spu_jobs, g_prof_mdec_jobs, g_prof_gpu_jobs);
+		fclose(lf);
+	}
+	g_aux_active = 0;
+	g_spu_reap = g_spu_submit;
+	g_gpu_reap = g_gpu_submit;
+	g_spu_busy[0] = g_spu_busy[1] = 0;
+	g_mdec_inflight = 0;
+	g_gpu_inflight = 0;
+}
+
+static void pcsx_aux_reap_spu_one(void)
+{
+	uint32_t seq = g_spu_reap;
+	uint32_t fidx = seq & 1U;
 	int timeout = 15000000;
 	int waited = 0;
 
-	while (g_aux_sram->done_seq <= seq) {
+	while (g_aux_sram->spu_done <= seq) {
 		waited = 1;
 		if (--timeout <= 0) {
-			printf("[pcsx-aux] WARNING: Hybrid AUX timeout (done=%u want=%u cmd=%u), disabling AUX!\n",
-			       g_aux_sram->done_seq, seq + 1, g_fifo_owner[fidx]);
-			FILE *lf = fopen("/tmp/pcsx_aux.log", "a");
-			if (lf) {
-				fprintf(lf, "TIMEOUT done=%u want=%u cmd=%u spu=%u mdec=%u gpu=%u\n",
-				        g_aux_sram->done_seq, seq + 1, g_fifo_owner[fidx],
-				        g_prof_spu_jobs, g_prof_mdec_jobs, g_prof_gpu_jobs);
-				fclose(lf);
-			}
-			g_aux_active = 0;
-			g_reap_seq = g_submit_seq;
-			g_spu_busy[0] = g_spu_busy[1] = 0;
-			g_mdec_inflight = 0;
-			g_gpu_inflight = 0;
+			pcsx_aux_disable_timeout("SPU/MDEC", g_aux_sram->spu_done, seq + 1);
 			return;
 		}
 	}
 	if (waited)
 		g_prof_waits++;
 
-	uint32_t owner = g_fifo_owner[fidx];
-	g_fifo_owner[fidx] = AUX_CMD_NONE;
-	g_reap_seq++;
+	uint32_t owner = g_spu_owner[fidx];
+	g_spu_owner[fidx] = AUX_CMD_NONE;
+	g_spu_reap++;
 
 	if (owner == AUX_CMD_SPU0 || owner == AUX_CMD_SPU1) {
 		uint32_t sidx = (owner == AUX_CMD_SPU1) ? 1U : 0U;
@@ -303,28 +317,50 @@ static void pcsx_aux_reap_one(void)
 		g_mdec_pend.out_bytes = 0;
 		if (g_mdec_inflight > 0) g_mdec_inflight--;
 		g_prof_mdec_jobs++;
-	} else if (owner == AUX_CMD_GPU) {
-		if (waited) g_prof_gpu_waits++;
-		g_prof_gpu_jobs++;
-		g_prof_gpu_prims += g_aux_sram->gpu_job.aux_prims_done;
-		g_prof_gpu_tmiss += g_aux_sram->gpu_job.aux_tile_miss;
-		g_gpu_inflight = 0;
-		if (g_aux_dma_ok && g_gpu_sync_len > 0) {
-			jz_aux_dma_sync(g_aux_ctx, &g_aux_vram_dma, g_gpu_sync_off, g_gpu_sync_len, JZ_AUX_SYNC_TO_CPU);
-			g_gpu_sync_len = 0;
+	}
+}
+
+static void pcsx_aux_reap_gpu_one(void)
+{
+	if (!g_gpu_inflight) return;
+	uint32_t seq = g_gpu_reap;
+	int timeout = 15000000;
+	int waited = 0;
+
+	while (g_aux_sram->gpu_done <= seq) {
+		waited = 1;
+		if (--timeout <= 0) {
+			pcsx_aux_disable_timeout("GPU", g_aux_sram->gpu_done, seq + 1);
+			return;
 		}
-		/* Dynamic Core 0 / Core 1 load balancer (converges split to zero-wait equilibrium) */
-		if (!g_gpu_split_pinned && g_gpu_split_pct > 0) {
-			g_gpu_tune_jobs++;
-			if (waited) g_gpu_tune_waits++;
-			if (g_gpu_tune_jobs >= 8U) {
-				if (g_gpu_tune_waits >= 6U && g_gpu_split_pct < 82)
-					g_gpu_split_pct += 2;
-				else if (g_gpu_tune_waits <= 1U && g_gpu_split_pct > 50)
-					g_gpu_split_pct -= 2;
-				g_gpu_tune_jobs = 0;
-				g_gpu_tune_waits = 0;
+	}
+	if (waited) {
+		g_prof_waits++;
+		g_prof_gpu_waits++;
+	}
+	g_gpu_reap++;
+	g_prof_gpu_jobs++;
+	g_prof_gpu_prims += g_aux_sram->gpu_job.aux_prims_done;
+	g_prof_gpu_tmiss += g_aux_sram->gpu_job.aux_tile_miss;
+	g_gpu_inflight = 0;
+	if (g_aux_dma_ok && g_gpu_sync_len > 0) {
+		jz_aux_dma_sync(g_aux_ctx, &g_aux_vram_dma, g_gpu_sync_off, g_gpu_sync_len, JZ_AUX_SYNC_TO_CPU);
+		g_gpu_sync_len = 0;
+	}
+	/* Dynamic Core 0 / Core 1 load balancer (0%..84%: allows 100% async AUX GPU on CPU-bound games!) */
+	if (!g_gpu_split_pinned && g_gpu_enabled) {
+		g_gpu_tune_jobs++;
+		if (waited) g_gpu_tune_waits++;
+		if (g_gpu_tune_jobs >= 8U) {
+			if (g_gpu_tune_waits >= 4U && g_gpu_split_pct < 84) {
+				g_gpu_split_pct += 4;
+				if (g_gpu_split_pct > 84) g_gpu_split_pct = 84;
+			} else if (g_gpu_tune_waits <= 1U && g_gpu_split_pct > 0) {
+				g_gpu_split_pct -= 4;
+				if (g_gpu_split_pct < 0) g_gpu_split_pct = 0;
 			}
+			g_gpu_tune_jobs = 0;
+			g_gpu_tune_waits = 0;
 		}
 	}
 }
@@ -332,29 +368,51 @@ static void pcsx_aux_reap_one(void)
 void pcsx_aux_reap_ready(void)
 {
 	if (!g_aux_active) return;
-	while (g_reap_seq != g_submit_seq && g_aux_sram->done_seq > g_reap_seq)
-		pcsx_aux_reap_one();
+	while (g_spu_reap != g_spu_submit && g_aux_sram->spu_done > g_spu_reap)
+		pcsx_aux_reap_spu_one();
+	if (g_gpu_inflight && g_aux_sram->gpu_done > g_gpu_reap)
+		pcsx_aux_reap_gpu_one();
 }
 
 void pcsx_aux_flush(void)
 {
 	if (!g_aux_active) return;
-	while (g_reap_seq != g_submit_seq && g_aux_active)
-		pcsx_aux_reap_one();
+	while (g_spu_reap != g_spu_submit && g_aux_active)
+		pcsx_aux_reap_spu_one();
+	if (g_gpu_inflight && g_aux_active)
+		pcsx_aux_reap_gpu_one();
+}
+
+void pcsx_aux_flush_spu(void)
+{
+	if (!g_aux_active) return;
+	while (g_spu_reap != g_spu_submit && g_aux_active)
+		pcsx_aux_reap_spu_one();
 }
 
 void pcsx_aux_flush_mdec(void)
 {
 	if (!g_aux_active || g_mdec_inflight == 0) return;
-	while (g_mdec_inflight > 0 && g_reap_seq != g_submit_seq && g_aux_active)
-		pcsx_aux_reap_one();
+	while (g_mdec_inflight > 0 && g_spu_reap != g_spu_submit && g_aux_active)
+		pcsx_aux_reap_spu_one();
 }
 
 void pcsx_aux_gpu_flush(void)
 {
 	if (!g_aux_active || !g_gpu_inflight) return;
-	while (g_gpu_inflight && g_reap_seq != g_submit_seq && g_aux_active)
-		pcsx_aux_reap_one();
+	pcsx_aux_reap_gpu_one();
+}
+
+void pcsx_aux_gpu_flush_rect(int x0, int y0, int x1, int y1)
+{
+	if (!g_aux_active || !g_gpu_inflight) return;
+	if (g_aux_sram->gpu_done > g_gpu_reap) {
+		pcsx_aux_reap_gpu_one();
+		return;
+	}
+	if (x1 <= g_gpu_x0 || x0 >= g_gpu_x1 || y1 <= g_gpu_y0 || y0 >= g_gpu_y1)
+		return; /* Non-overlapping (e.g. double-buffered vout displaying Buffer A while AUX draws Buffer B!) */
+	pcsx_aux_reap_gpu_one();
 }
 
 int pcsx_aux_is_active(void) { return g_aux_active; }
@@ -367,9 +425,9 @@ int pcsx_aux_acquire_slot(uint32_t *out_slot_idx)
 	if (!g_aux_active) return 0;
 	pcsx_aux_reap_ready();
 	uint32_t sidx = g_spu_next;
-	/* Wait only if MDEC owns TCSM0, our target SPU ping-pong half-slot is busy, or 4-entry FIFO is full */
-	while ((g_mdec_inflight || g_spu_busy[sidx] || (g_submit_seq - g_reap_seq) >= 4U) && g_aux_active)
-		pcsx_aux_reap_one();
+	/* Independent SPU ring: NEVER blocks on GPU! AUX preemptively services SPU between GPU bands! */
+	while ((g_mdec_inflight || g_spu_busy[sidx] || (g_spu_submit - g_spu_reap) >= 2U) && g_aux_active)
+		pcsx_aux_reap_spu_one();
 	if (!g_aux_active) return 0;
 	g_spu_next = sidx ^ 1U;
 	*out_slot_idx = sidx;
@@ -378,18 +436,24 @@ int pcsx_aux_acquire_slot(uint32_t *out_slot_idx)
 
 void pcsx_aux_submit_slot(uint32_t slot_idx, uint32_t cmd_type)
 {
-	uint32_t fidx = g_submit_seq & 3U;
+	if (cmd_type == AUX_CMD_GPU) {
+		__sync_synchronize();
+		g_gpu_submit++;
+		g_aux_sram->gpu_submit = g_gpu_submit;
+		return;
+	}
+	uint32_t fidx = g_spu_submit & 1U;
 	uint32_t wire_cmd = cmd_type;
 	if (cmd_type == AUX_CMD_SPU) {
 		uint32_t sidx = slot_idx & 1U;
 		g_spu_busy[sidx] = 1;
 		wire_cmd = sidx ? AUX_CMD_SPU1 : AUX_CMD_SPU0;
 	}
-	g_fifo_owner[fidx] = wire_cmd;
-	g_aux_sram->slot_cmd[fidx] = wire_cmd;
+	g_spu_owner[fidx] = wire_cmd;
+	g_aux_sram->spu_cmd[fidx] = wire_cmd;
 	__sync_synchronize();
-	g_submit_seq++;
-	g_aux_sram->submit_seq = g_submit_seq;
+	g_spu_submit++;
+	g_aux_sram->spu_submit = g_spu_submit;
 }
 
 void pcsx_aux_mdec_set_iq(const int *iq_y, const int *iq_uv)
@@ -414,8 +478,8 @@ int pcsx_aux_mdec_submit(const uint16_t *rl_src, uint32_t rl_words,
 
 	/* MDEC uses full 16 KB TCSM0: drain any in-flight SPU/MDEC first */
 	pcsx_aux_reap_ready();
-	while ((g_spu_busy[0] || g_spu_busy[1] || g_mdec_inflight || (g_submit_seq - g_reap_seq) >= 4U) && g_aux_active)
-		pcsx_aux_reap_one();
+	while ((g_spu_busy[0] || g_spu_busy[1] || g_mdec_inflight || (g_spu_submit - g_spu_reap) >= 2U) && g_aux_active)
+		pcsx_aux_reap_spu_one();
 	if (!g_aux_active)
 		return 0;
 
@@ -455,13 +519,15 @@ void *pcsx_aux_vram_alloc(size_t size)
 		printf("-> /dev/jz_aux DMA DL alloc failed; half-screen AUX GPU disabled.\n");
 		return NULL;
 	}
+	memset(g_aux_vram_dma.virt, 0, AUX_DMA_VRAM_SIZE);
 	g_aux_dma_ok = 1;
 	g_vram_dma_off = 4096U;
 	g_vram_phys = g_aux_vram_dma.phys + g_vram_dma_off;
 	g_dl_phys   = g_aux_dl_dma.phys;
+	g_dl_idx    = 0;
 	check_gpu_env();
-	printf("-> AUX GPU DDR2 DMA VRAM ready! vram=0x%08x(2MB) dl=0x%08x(512KB) split=%d%% Main / %d%% AUX\n",
-	       g_aux_vram_dma.phys, g_aux_dl_dma.phys, g_gpu_split_pct, 100 - g_gpu_split_pct);
+	printf("-> AUX GPU DDR2 DMA VRAM ready! vram=0x%08x(2MB) dl=0x%08x(2x256KB) en=%d split=%d%% Main / %d%% AUX\n",
+	       g_aux_vram_dma.phys, g_aux_dl_dma.phys, g_gpu_enabled, g_gpu_split_pct, 100 - g_gpu_split_pct);
 	return g_aux_vram_dma.virt;
 }
 
@@ -488,7 +554,7 @@ void pcsx_aux_vram_free(void)
 int pcsx_aux_gpu_ready(void)
 {
 	check_gpu_env();
-	return (g_aux_active && g_aux_dma_ok && g_gpu_split_pct > 0);
+	return (g_aux_active && g_aux_dma_ok && g_gpu_enabled);
 }
 
 int pcsx_aux_gpu_split_pct(void)
@@ -509,8 +575,8 @@ uint32_t *pcsx_aux_gpu_dl_ptr(uint32_t *out_max_words)
 		if (out_max_words) *out_max_words = 0;
 		return NULL;
 	}
-	if (out_max_words) *out_max_words = AUX_DMA_DL_SIZE >> 2;
-	return (uint32_t *)g_aux_dl_dma.virt;
+	if (out_max_words) *out_max_words = AUX_DMA_DL_HALF >> 2;
+	return (uint32_t *)((uint8_t *)g_aux_dl_dma.virt + (g_dl_idx * AUX_DMA_DL_HALF));
 }
 
 int pcsx_aux_gpu_submit(const struct pcsx_aux_gpu_params *p)
@@ -518,19 +584,21 @@ int pcsx_aux_gpu_submit(const struct pcsx_aux_gpu_params *p)
 	if (!g_aux_active || !g_aux_dma_ok || !p || p->dl_words == 0)
 		return 0;
 
-	/* Wait if a previous GPU job is still in flight or 4-entry FIFO is full */
-	pcsx_aux_reap_ready();
-	while ((g_gpu_inflight || (g_submit_seq - g_reap_seq) >= 4U) && g_aux_active)
-		pcsx_aux_reap_one();
+	/* Wait only if previous GPU job is still in flight (NEVER waits on SPU!) */
+	if (g_gpu_inflight)
+		pcsx_aux_reap_gpu_one();
 	if (!g_aux_active) return 0;
 
 	/* Flush Main CPU L1 D-cache -> DDR2 (size >= 16KB triggers one r4k_blast_dcache()
 	 * in ~60us, flushing ALL dirty L1 lines across BOTH VRAM and DL buffer!) */
 	jz_aux_dma_sync(g_aux_ctx, &g_aux_vram_dma, 0U, AUX_DMA_VRAM_SIZE, JZ_AUX_SYNC_TO_DEV);
 
+	uint32_t dl_phys_cur = g_dl_phys + (g_dl_idx * AUX_DMA_DL_HALF);
+	g_dl_idx ^= 1U; /* Flip ping-pong DL half so next batch NEVER races active AUX reads! */
+
 	volatile struct aux_gpu_job *j = &g_aux_sram->gpu_job;
 	j->vram_phys      = g_vram_phys;
-	j->dl_phys        = g_dl_phys;
+	j->dl_phys        = dl_phys_cur;
 	j->dl_words       = p->dl_words;
 	j->strip_x0       = p->strip_x0;
 	j->strip_x1       = p->strip_x1;
@@ -552,7 +620,11 @@ int pcsx_aux_gpu_submit(const struct pcsx_aux_gpu_params *p)
 	j->aux_prims_done = 0;
 	j->aux_tile_miss  = 0;
 
-	/* Record exact bottom-band DDR2 range to invalidate on reap */
+	/* Record exact active AUX rect + DDR2 range for overlap-aware flush & cache inv */
+	g_gpu_x0       = p->strip_x0;
+	g_gpu_x1       = p->strip_x1;
+	g_gpu_y0       = p->band_y0;
+	g_gpu_y1       = p->band_y1;
 	g_gpu_sync_off = g_vram_dma_off + ((uint32_t)p->band_y0 << 11);
 	g_gpu_sync_len = (uint32_t)(p->band_y1 - p->band_y0) << 11;
 	g_gpu_inflight = 1;
@@ -597,18 +669,22 @@ void pcsx_aux_init(void)
 	for (size_t i = 0; i < (sizeof(struct aux_hybrid_sram) + 3) / 4; i++)
 		s32[i] = 0;
 
+	/* Populate PS1 SPU Gaussian table in SRAM (moved from TCSM1 .rodata -> +2 KB stack!) */
+	volatile struct aux_hybrid_sram *sram = (volatile struct aux_hybrid_sram *)ctx->sram;
+	for (size_t i = 0; i < 1024; i++)
+		sram->gauss[i] = (int16_t)gauss[i];
+
 	if (jz_aux_load(ctx, aux_pcsx_hybrid_fw, sizeof(aux_pcsx_hybrid_fw), 1, 1) < 0) {
-		printf("-> /dev/jz_aux hybrid v3 firmware load failed; running on main CPU.\n");
+		printf("-> /dev/jz_aux hybrid v4 firmware load failed; running on main CPU.\n");
 		jz_aux_close(ctx);
 		return;
 	}
 
-	volatile struct aux_hybrid_sram *sram = (volatile struct aux_hybrid_sram *)ctx->sram;
 	int tries = 300000;
 	while (sram->magic != AUX_HYBRID_MAGIC && --tries > 0)
 		;
 	if (sram->magic != AUX_HYBRID_MAGIC) {
-		printf("-> /dev/jz_aux hybrid v3 firmware boot timeout (magic=0x%08x).\n", sram->magic);
+		printf("-> /dev/jz_aux hybrid v4 firmware boot timeout (magic=0x%08x).\n", sram->magic);
 		jz_aux_close(ctx);
 		return;
 	}
@@ -616,12 +692,14 @@ void pcsx_aux_init(void)
 	g_aux_ctx      = ctx;
 	g_aux_sram     = sram;
 	g_aux_slot0    = (volatile union aux_hybrid_slot *)ctx->tcsm0;
-	g_submit_seq   = 0;
-	g_reap_seq     = 0;
-	g_fifo_owner[0] = g_fifo_owner[1] = g_fifo_owner[2] = g_fifo_owner[3] = AUX_CMD_NONE;
+	g_spu_submit   = 0;
+	g_spu_reap     = 0;
+	g_spu_owner[0] = g_spu_owner[1] = AUX_CMD_NONE;
 	g_spu_busy[0]  = g_spu_busy[1] = 0;
 	g_spu_next     = 0;
 	g_mdec_inflight = 0;
+	g_gpu_submit   = 0;
+	g_gpu_reap     = 0;
 	g_gpu_inflight = 0;
 	g_prof_spu_jobs = 0;
 	g_prof_mdec_jobs = 0;
@@ -632,11 +710,11 @@ void pcsx_aux_init(void)
 	g_prof_gpu_tmiss = 0;
 	g_aux_active   = 1;
 
-	printf("-> JZ4760B HYBRID v3 AUX+MXU+DMAGP1 COPROCESSOR ACTIVE! (%u MHz HCLK, fw=%uB, SPU+MDEC+GPU)\n",
+	printf("-> JZ4760B HYBRID v4 AUX+MXU+DMAGP1 COPROCESSOR ACTIVE! (%u MHz HCLK, fw=%uB, preempt-SPU+MDEC+GPU)\n",
 	       ctx->info.hclk_mhz, (unsigned)sizeof(aux_pcsx_hybrid_fw));
 	FILE *lf = fopen("/tmp/pcsx_aux.log", "w");
 	if (lf) {
-		fprintf(lf, "ACTIVE HYBRID v3 hclk=%uMHz cclk=%uMHz fw=%uB\n",
+		fprintf(lf, "ACTIVE HYBRID v4 hclk=%uMHz cclk=%uMHz fw=%uB\n",
 		        ctx->info.hclk_mhz, ctx->info.cclk_mhz, (unsigned)sizeof(aux_pcsx_hybrid_fw));
 		fclose(lf);
 	}
@@ -648,7 +726,7 @@ void pcsx_aux_shutdown(void)
 		return;
 	pcsx_aux_flush();
 	pcsx_aux_vram_free();
-	printf("-> JZ4760B Hybrid v3 AUX stats: spu=%u mdec=%u gpu=%u(w=%u p=%u tm=%u) waits=%u\n",
+	printf("-> JZ4760B Hybrid v4 AUX stats: spu=%u mdec=%u gpu=%u(w=%u p=%u tm=%u) waits=%u\n",
 	       g_prof_spu_jobs, g_prof_mdec_jobs, g_prof_gpu_jobs, g_prof_gpu_waits,
 	       g_prof_gpu_prims, g_prof_gpu_tmiss, g_prof_waits);
 	FILE *lf = fopen("/tmp/pcsx_aux.log", "a");
@@ -672,6 +750,7 @@ void pcsx_aux_shutdown(void) {}
 int  pcsx_aux_is_active(void) { return 0; }
 void pcsx_aux_reap_ready(void) {}
 void pcsx_aux_flush(void) {}
+void pcsx_aux_flush_spu(void) {}
 void pcsx_aux_flush_mdec(void) {}
 void pcsx_aux_register_spu(pcsx_aux_spu_reap_fn reap_fn) { (void)reap_fn; }
 void *pcsx_aux_get_sram(void) { return NULL; }
@@ -695,6 +774,7 @@ int   pcsx_aux_gpu_verify_mode(void) { return 0; }
 uint32_t *pcsx_aux_gpu_dl_ptr(uint32_t *out_max_words) { if (out_max_words) *out_max_words = 0; return NULL; }
 int   pcsx_aux_gpu_submit(const struct pcsx_aux_gpu_params *p) { (void)p; return 0; }
 void  pcsx_aux_gpu_flush(void) {}
+void  pcsx_aux_gpu_flush_rect(int x0, int y0, int x1, int y1) { (void)x0; (void)y0; (void)x1; (void)y1; }
 void pcsx_aux_get_stats(uint32_t *spu_jobs, uint32_t *mdec_jobs, uint32_t *waits)
 {
 	if (spu_jobs)  *spu_jobs  = 0;

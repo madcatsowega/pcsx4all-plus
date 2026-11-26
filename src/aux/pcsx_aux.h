@@ -17,6 +17,7 @@ int  pcsx_aux_is_active(void);
 /* Reap any completed slots (non-blocking) or flush all in-flight slots (blocking). */
 void pcsx_aux_reap_ready(void);
 void pcsx_aux_flush(void);
+void pcsx_aux_flush_spu(void);
 void pcsx_aux_flush_mdec(void);
 
 /* SPU hooks (called by spu_jzaux.c) */
@@ -64,6 +65,7 @@ int       pcsx_aux_gpu_verify_mode(void);
 uint32_t *pcsx_aux_gpu_dl_ptr(uint32_t *out_max_words);
 int       pcsx_aux_gpu_submit(const struct pcsx_aux_gpu_params *p);
 void      pcsx_aux_gpu_flush(void);
+void      pcsx_aux_gpu_flush_rect(int x0, int y0, int x1, int y1);
 
 /* Telemetry for frontend/log */
 void pcsx_aux_get_stats(uint32_t *spu_jobs, uint32_t *mdec_jobs, uint32_t *waits);

@@ -89,7 +89,7 @@ static void spu_jzaux_reap_ready(void)
 static void spu_jzaux_flush(void)
 {
 	if (!g_spu_aux_active) return;
-	pcsx_aux_flush();
+	pcsx_aux_flush_spu();
 	if (!pcsx_aux_is_active())
 		g_spu_aux_active = 0;
 }
@@ -211,6 +211,7 @@ static int spu_jzaux_queue_slice(int ns_to, unsigned int silentch)
 	volatile struct aux_spu_slot *slot = g_spu_aux_slots[idx];
 
 	uint32_t new_mask = spu.dwNewChannel & 0xffffffU;
+	uint32_t saved_mask = 0;
 	for (uint32_t m = new_mask, ch = 0; m != 0; ch++, m >>= 1) {
 		if (m & 1U) {
 			SPUCHAN *sc = &spu.s_chan[ch];
@@ -222,6 +223,7 @@ static int spu_jzaux_queue_slice(int ns_to, unsigned int silentch)
 			saved_ch[ch].adsr_state = sc->ADSRX.State;
 			saved_ch[ch].adsr_env   = sc->ADSRX.EnvelopeVol;
 			saved_ch[ch].bRVBActive = sc->bRVBActive;
+			saved_mask |= (1U << ch);
 			StartSoundMain(ch);
 		}
 	}
@@ -232,7 +234,7 @@ static int spu_jzaux_queue_slice(int ns_to, unsigned int silentch)
 	for (uint32_t m = active_mask, ch = 0; m != 0; ch++, m >>= 1) {
 		if (!(m & 1U)) continue;
 		SPUCHAN *s_chan = &spu.s_chan[ch];
-		if (!(new_mask & (1U << ch))) {
+		if (!(saved_mask & (1U << ch))) {
 			saved_ch[ch].pCurr      = s_chan->pCurr;
 			saved_ch[ch].pLoop      = s_chan->pLoop;
 			saved_ch[ch].spos       = s_chan->spos;
@@ -241,6 +243,7 @@ static int spu_jzaux_queue_slice(int ns_to, unsigned int silentch)
 			saved_ch[ch].adsr_state = s_chan->ADSRX.State;
 			saved_ch[ch].adsr_env   = s_chan->ADSRX.EnvelopeVol;
 			saved_ch[ch].bRVBActive = s_chan->bRVBActive;
+			saved_mask |= (1U << ch);
 		}
 		volatile struct aux_spu_ch *ac = &slot->ch[ch];
 
@@ -270,7 +273,7 @@ static int spu_jzaux_queue_slice(int ns_to, unsigned int silentch)
 		} else {
 			d = do_samples_skip_collect(ch, ns_to, slot->adpcm_blocks, &blk_total);
 			if (d < 0) {
-				for (uint32_t rm = (active_mask | new_mask), rch = 0; rm != 0; rch++, rm >>= 1) {
+				for (uint32_t rm = saved_mask, rch = 0; rm != 0; rch++, rm >>= 1) {
 					if (rm & 1U) {
 						SPUCHAN *sc = &spu.s_chan[rch];
 						sc->pCurr             = saved_ch[rch].pCurr;

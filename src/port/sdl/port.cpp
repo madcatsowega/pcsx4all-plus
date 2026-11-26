@@ -377,6 +377,9 @@ void config_load()
 
 void config_save()
 {
+	if (getenv("PCSX_BENCH_FRAMES") != NULL)
+		return;
+
 	FILE *f;
 	char *config = (char *)malloc(strlen(homedir) + strlen("/pcsx4all.retrofw.cfg") + 1);
 
