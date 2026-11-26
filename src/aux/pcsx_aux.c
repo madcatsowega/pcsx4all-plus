@@ -439,6 +439,7 @@ void pcsx_aux_submit_slot(uint32_t slot_idx, uint32_t cmd_type)
 	if (cmd_type == AUX_CMD_GPU) {
 		__sync_synchronize();
 		g_gpu_submit++;
+		g_aux_sram->total_submit = g_spu_submit + g_gpu_submit;
 		g_aux_sram->gpu_submit = g_gpu_submit;
 		return;
 	}
@@ -453,6 +454,7 @@ void pcsx_aux_submit_slot(uint32_t slot_idx, uint32_t cmd_type)
 	g_aux_sram->spu_cmd[fidx] = wire_cmd;
 	__sync_synchronize();
 	g_spu_submit++;
+	g_aux_sram->total_submit = g_spu_submit + g_gpu_submit;
 	g_aux_sram->spu_submit = g_spu_submit;
 }
 
