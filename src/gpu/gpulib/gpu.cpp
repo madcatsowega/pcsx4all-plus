@@ -15,6 +15,9 @@
 #include "gpu.h"
 #include "plugin_lib.h"
 #include "aux/pcsx_prof.h"
+#ifdef RS97
+#include "aux/pcsx_aux.h"
+#endif
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #ifdef __GNUC__
@@ -198,6 +201,7 @@ static noinline void get_gpu_info(uint32_t data)
 
 // vram ptr received from mmap/malloc/alloc (will deallocate using this)
 static uint16_t *vram_ptr_orig = NULL;
+static int vram_is_aux_dma = 0;
 
 #ifdef GPULIB_USE_MMAP
 static int map_vram(void)
@@ -218,6 +222,19 @@ static int map_vram(void)
 #else
 static int allocate_vram(void)
 {
+  vram_is_aux_dma = 0;
+#ifdef RS97
+  pcsx_aux_init();
+  void *dma_vram = pcsx_aux_vram_alloc(VRAM_SIZE + (VRAM_ALIGN-1));
+  if (dma_vram != NULL) {
+    gpu.vram = vram_ptr_orig = (uint16_t*)dma_vram;
+    gpu.vram += (4096 / 2);
+    gpu.vram = (uint16_t*)(((uintptr_t)gpu.vram + (VRAM_ALIGN-1)) & ~(VRAM_ALIGN-1));
+    pcsx_aux_vram_set_ptr(gpu.vram);
+    vram_is_aux_dma = 1;
+    return 0;
+  }
+#endif
   gpu.vram = vram_ptr_orig = (uint16_t*)calloc(VRAM_SIZE + (VRAM_ALIGN-1), 1);
   if (gpu.vram != NULL) {
 	// 4kb guard in front
@@ -270,7 +287,14 @@ long GPU_shutdown(void)
 #ifdef GPULIB_USE_MMAP
     gpu.munmap(vram_ptr_orig, VRAM_SIZE);
 #else
-    free(vram_ptr_orig);
+    if (vram_is_aux_dma) {
+#ifdef RS97
+      pcsx_aux_vram_free();
+#endif
+      vram_is_aux_dma = 0;
+    } else {
+      free(vram_ptr_orig);
+    }
 #endif
   }
   vram_ptr_orig = gpu.vram = NULL;
@@ -645,6 +669,15 @@ long GPU_dmaChain(uint32_t *rambase, uint32_t start_addr)
   if (unlikely(gpu.cmd_len > 0))
     flush_cmd_buffer();
 
+#ifdef RS97
+  /* Flatten OT linked-list nodes into a contiguous batch so do_cmd_list() can
+   * dispatch the entire bottom half of the frame to the 330 MHz AUX core via DMAGP1
+   * in parallel with Main CPU top-half rendering! */
+  static uint32_t chain_flat[32768];
+  uint32_t flat_len = 0;
+  int use_flat = pcsx_aux_gpu_ready() && !gpu.dma.h && !(gpu.frameskip.active && gpu.frameskip.allow);
+#endif
+
   log_io("gpu_dma_chain\n");
   addr = start_addr & 0xffffff;
   for (count = 0; (addr & 0x800000) == 0; count++)
@@ -661,9 +694,34 @@ long GPU_dmaChain(uint32_t *rambase, uint32_t start_addr)
     log_io(".chain %08x #%d\n", (list - rambase) * 4, len);
 
     if (len) {
-      left = do_cmd_buffer(list + 1, len);
-      if (left)
-        log_anomaly("GPUdmaChain: discarded %d/%d words\n", left, len);
+#ifdef RS97
+      if (use_flat) {
+        if (flat_len + (uint32_t)len > 32768U) {
+          left = do_cmd_buffer(chain_flat, (int)flat_len);
+          if (left) log_anomaly("GPUdmaChain: discarded %d/%u words\n", left, flat_len);
+          flat_len = 0;
+        }
+        uint32_t first_cmd = list[1] >> 24;
+        if (first_cmd >= 0xa0 && first_cmd <= 0xdf) {
+          if (flat_len) {
+            left = do_cmd_buffer(chain_flat, (int)flat_len);
+            if (left) log_anomaly("GPUdmaChain: discarded %d/%u words\n", left, flat_len);
+            flat_len = 0;
+          }
+          left = do_cmd_buffer(list + 1, len);
+          if (left) log_anomaly("GPUdmaChain: discarded %d/%d words\n", left, len);
+          if (gpu.dma.h) use_flat = 0;
+        } else {
+          memcpy(&chain_flat[flat_len], list + 1, (size_t)len * 4U);
+          flat_len += (uint32_t)len;
+        }
+      } else
+#endif
+      {
+        left = do_cmd_buffer(list + 1, len);
+        if (left)
+          log_anomaly("GPUdmaChain: discarded %d/%d words\n", left, len);
+      }
     }
 
     #define LD_THRESHOLD (8*1024)
@@ -679,6 +737,14 @@ long GPU_dmaChain(uint32_t *rambase, uint32_t start_addr)
       list[0] |= 0x800000;
     }
   }
+
+#ifdef RS97
+  if (flat_len > 0) {
+    left = do_cmd_buffer(chain_flat, (int)flat_len);
+    if (left)
+      log_anomaly("GPUdmaChain: discarded %d/%u words\n", left, flat_len);
+  }
+#endif
 
   if (ld_addr != 0) {
     // remove loop detection markers
@@ -745,12 +811,14 @@ long GPU_freeze(uint32_t type, GPUFreeze_t *freeze)
     case 1: // save
       if (gpu.cmd_len > 0)
         flush_cmd_buffer();
+      renderer_flush_queues();
       memcpy(freeze->psxVRam, gpu.vram, 1024 * 512 * 2);
       memcpy(freeze->ulControl, gpu.regs, sizeof(gpu.regs));
       memcpy(freeze->ulControl + 0xe0, gpu.ex_regs, sizeof(gpu.ex_regs));
       freeze->ulStatus = gpu.status.reg;
       break;
     case 0: // load
+      renderer_flush_queues();
       memcpy(gpu.vram, freeze->psxVRam, 1024 * 512 * 2);
       memcpy(gpu.regs, freeze->ulControl, sizeof(gpu.regs));
       memcpy(gpu.ex_regs, freeze->ulControl + 0xe0, sizeof(gpu.ex_regs));

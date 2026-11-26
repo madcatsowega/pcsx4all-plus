@@ -333,8 +333,8 @@ static void spu_jzaux_init(void)
 		return;
 
 	g_spu_aux_sram     = (volatile struct aux_hybrid_sram *)pcsx_aux_get_sram();
-	g_spu_aux_slots[0] = &((volatile union aux_hybrid_slot *)pcsx_aux_get_slot(0))->spu;
-	g_spu_aux_slots[1] = &((volatile union aux_hybrid_slot *)pcsx_aux_get_slot(1))->spu;
+	g_spu_aux_slots[0] = (volatile struct aux_spu_slot *)pcsx_aux_get_slot(0);
+	g_spu_aux_slots[1] = (volatile struct aux_spu_slot *)pcsx_aux_get_slot(1);
 	g_spu_aux_fallbacks = 0;
 
 	pcsx_aux_register_spu(spu_jzaux_on_reap);
