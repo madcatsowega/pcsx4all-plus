@@ -18,6 +18,10 @@
 
 #include "port.h"
 #include "gpu.h"
+#include "aux/pcsx_prof.h"
+#ifdef RS97
+#include "gpu/gpu_unai/gpu_mxu.h"
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 // BLITTERS TAKEN FROM gpu_unai/gpu_blit.h
@@ -100,6 +104,12 @@ static inline void GPU_Blit320(const void* src, u16* dst16, bool isRGB24)
 	if (!isRGB24)
 	{
 #ifndef USE_BGR15
+#ifdef RS97
+		if (spu_use_mxu) {
+			gpu_blit320_mxu((const u16*)src, dst16);
+			return;
+		}
+#endif
 		uCount = 20;
 		const u32* src32 = (const u32*) src;
 		u32* dst32 = (u32*)(void*) dst16;
@@ -164,6 +174,12 @@ static inline void GPU_Blit512(const void* src, u16* dst16, bool isRGB24)
 	if (!isRGB24)
 	{
 #ifndef USE_BGR15
+#ifdef RS97
+		if (gpu_unai_config_ext.pixel_skip && spu_use_mxu) {
+			gpu_blit512_skip_mxu((const u16*)src, dst16);
+			return;
+		}
+#endif
 		uCount = 32;
 		u16* src16 = (u16*)src;
 		do {
@@ -585,6 +601,12 @@ static inline void GPU_Blit640(const void* src, u16* dst16, bool isRGB24)
 	u32 uCount;
 	if (!isRGB24) {
 #ifndef USE_BGR15
+#ifdef RS97
+		if (gpu_unai_config_ext.pixel_skip && spu_use_mxu) {
+			gpu_blit640_skip_mxu((const u16*)src, dst16);
+			return;
+		}
+#endif
 		uCount = 20;
 		u16* src16 = (u16*)src;
 		do {
@@ -698,6 +720,8 @@ void vout_update(void)
 
 	if (w0 == 0 || h0 == 0)
 		return;
+	g_pcsx_prof.res_w = (uint32_t)w0;
+	g_pcsx_prof.res_h = (uint32_t)h0;
 
 	bool isRGB24 = gpu.status.rgb24;
 	u16* dst16 = SCREEN;

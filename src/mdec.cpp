@@ -19,6 +19,13 @@
  ***************************************************************************/
 
 #include "mdec.h"
+#include "aux/pcsx_aux.h"
+#include "aux/pcsx_prof.h"
+
+#define AUX_MDEC_MAX_RL_HOST   2048U
+#define AUX_MDEC_FLAG_RGB15_H  (1U << 0)
+#define AUX_MDEC_FLAG_BW_H     (1U << 1)
+#define AUX_MDEC_FLAG_STP_H    (1U << 2)
 
 /* memory speed is 1 byte per MDEC_BIAS psx clock
  * That mean (PSXCLK / MDEC_BIAS) B/s
@@ -454,6 +461,7 @@ u32 mdecRead0(void) {
 // status register
 void mdecWrite1(u32 data) {
 	if (data & MDEC1_RESET) { // mdec reset
+		pcsx_aux_flush_mdec();
 		mdec.reg0 = 0;
 		mdec.reg1 = 0;
 		mdec.pending_dma1.adr = 0;
@@ -481,6 +489,7 @@ void psxDma0(u32 adr, u32 bcr, u32 chcr) {
 
 	switch (cmd >> 28) {
 		case 0x3: // decode
+			pcsx_aux_flush_mdec();
 			mdec.rl = (u16 *) PSXM(adr);
 			/* now the mdec is busy till all data are decoded */
 			mdec.reg1 |= MDEC1_BUSY;
@@ -508,6 +517,7 @@ void psxDma0(u32 adr, u32 bcr, u32 chcr) {
 				// printmatrixu8(p + 64);
 				iqtab_init(iq_y, p);
 				iqtab_init(iq_uv, p + 64);
+				pcsx_aux_mdec_set_iq(iq_y, iq_uv);
 			}
 
 			MDECINDMA_INT( size / 4 );
@@ -540,6 +550,30 @@ void mdec0Interrupt()
 #define SIZE_OF_24B_BLOCK (16*16*3)
 #define SIZE_OF_16B_BLOCK (16*16*2)
 
+/* Fast scan of exact RLE halfword count for n_blocks macroblocks (6 blocks each).
+ * Returns 0 if stream exceeds AUX_MDEC_MAX_RL_HOST or hits rl_end prematurely. */
+static u32 mdec_scan_rl_blocks(const u16 *rl, const u16 *rl_end, int n_blocks)
+{
+	const u16 *p = rl;
+	const u16 *lim = rl + AUX_MDEC_MAX_RL_HOST;
+	if (rl_end < lim) lim = rl_end;
+
+	int total_sub = n_blocks * 6;
+	for (int i = 0; i < total_sub; i++) {
+		if (p >= lim) return 0;
+		p++; /* DC + q_scale */
+		int k = 0;
+		for (;;) {
+			if (p >= lim) return 0;
+			u16 w = SWAP16(*p++);
+			if (w == MDEC_END_OF_DATA) break;
+			k += RLE_RUN(w) + 1;
+			if (k > 63) break;
+		}
+	}
+	return (u32)(p - rl);
+}
+
 void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 	int blk[DSIZE2 * 6];
 	u8 * image;
@@ -559,6 +593,7 @@ void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 		mdec.pending_dma1.chcr = chcr;
 		/* do not free the dma */
 	} else {
+		uint64_t _mt0 = __builtin_expect(g_pcsx_prof.enabled, 0) ? pcsx_prof_now_us() : 0;
 		image = (u8 *)PSXM(adr);
 
 		if (mdec.reg0 & MDEC0_RGB24) {
@@ -574,6 +609,28 @@ void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 				image += n;
 				size -= n;
 				mdec.block_buffer_pos = 0;
+			}
+
+			if (pcsx_aux_is_active() && size >= SIZE_OF_16B_BLOCK) {
+				u32 flags = AUX_MDEC_FLAG_RGB15_H |
+				            (Config.Mdec ? AUX_MDEC_FLAG_BW_H : 0U) |
+				            ((mdec.reg0 & MDEC0_STP) ? AUX_MDEC_FLAG_STP_H : 0U);
+				while (size >= SIZE_OF_16B_BLOCK) {
+					int batch = size / SIZE_OF_16B_BLOCK;
+					if (batch > 22) batch = 22;
+					u32 rlw = 0;
+					while (batch > 0) {
+						rlw = mdec_scan_rl_blocks(mdec.rl, mdec.rl_end, batch);
+						if (rlw != 0) break;
+						batch >>= 1;
+					}
+					if (batch == 0 || !pcsx_aux_mdec_submit(mdec.rl, rlw, (u32)batch, flags,
+					                                        image, (u32)(batch * SIZE_OF_16B_BLOCK)))
+						break;
+					mdec.rl += rlw;
+					image   += batch * SIZE_OF_16B_BLOCK;
+					size    -= batch * SIZE_OF_16B_BLOCK;
+				}
 			}
 
 			while(size >= SIZE_OF_16B_BLOCK) {
@@ -605,6 +662,26 @@ void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 				mdec.block_buffer_pos = 0;
 			}
 
+			if (pcsx_aux_is_active() && size >= SIZE_OF_24B_BLOCK) {
+				u32 flags = Config.Mdec ? AUX_MDEC_FLAG_BW_H : 0U;
+				while (size >= SIZE_OF_24B_BLOCK) {
+					int batch = size / SIZE_OF_24B_BLOCK;
+					if (batch > 15) batch = 15;
+					u32 rlw = 0;
+					while (batch > 0) {
+						rlw = mdec_scan_rl_blocks(mdec.rl, mdec.rl_end, batch);
+						if (rlw != 0) break;
+						batch >>= 1;
+					}
+					if (batch == 0 || !pcsx_aux_mdec_submit(mdec.rl, rlw, (u32)batch, flags,
+					                                        image, (u32)(batch * SIZE_OF_24B_BLOCK)))
+						break;
+					mdec.rl += rlw;
+					image   += batch * SIZE_OF_24B_BLOCK;
+					size    -= batch * SIZE_OF_24B_BLOCK;
+				}
+			}
+
 			while(size >= SIZE_OF_24B_BLOCK) {
 				mdec.rl = rl2blk(blk, mdec.rl);
 				yuv2rgb24(blk, image);
@@ -621,11 +698,15 @@ void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 		}
 
 		/* define the power of mdec */
+		if (__builtin_expect(g_pcsx_prof.enabled, 0))
+			g_pcsx_prof.mdec_us += pcsx_prof_now_us() - _mt0;
 		MDECOUTDMA_INT(words * MDEC_BIAS);
 	}
 }
 
 void mdec1Interrupt() {
+	/* Ensure asynchronous AUX MDEC decode has finished copying into PSX RAM */
+	pcsx_aux_flush_mdec();
 	/* Author : gschwind
 	 *
 	 * in that case we have done all decoding stuff
@@ -669,6 +750,7 @@ void mdec1Interrupt() {
 
 int mdecFreeze(void* f, FreezeMode mode)
 {
+	pcsx_aux_flush_mdec();
 	u8 *base = (u8 *)&psxM[0x100000];
 	u32 v;
 
@@ -700,6 +782,9 @@ int mdecFreeze(void* f, FreezeMode mode)
 	     freeze_rw(f, mode, iq_y, sizeof(iq_y))                            ||
 	     freeze_rw(f, mode, iq_uv, sizeof(iq_uv)) )
 		return -1;
+
+	if (mode == FREEZE_LOAD)
+		pcsx_aux_mdec_set_iq(iq_y, iq_uv);
 
 	return 0;
 }

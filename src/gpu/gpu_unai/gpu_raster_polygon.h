@@ -1327,7 +1327,12 @@ static void gpuDrawTriGT_Mono4(const PolyVertex **vptrs)
 					v4 += dv4 * (xmin - xa);
 					xa = xmin;
 				}
-				if (all_opaque)
+				if (gpu_unai.blit_mask) {
+					if (all_opaque)
+						gpuPolySpanFlat4OpaqueSkip(PixelBase + xa, xb - xa, gpu_unai.blit_mask, tba8, row, u4, v4, du4, dv4);
+					else
+						gpuPolySpanFlat4MaskedSkip(PixelBase + xa, xb - xa, gpu_unai.blit_mask, tba8, row, omask, u4, v4, du4, dv4);
+				} else if (all_opaque)
 					gpuPolySpanFlat4Opaque(PixelBase + xa, xb - xa, tba8, row, u4, v4, du4, dv4);
 				else
 					gpuPolySpanFlat4Masked(PixelBase + xa, xb - xa, tba8, row, omask, u4, v4, du4, dv4);
@@ -1360,7 +1365,12 @@ static void gpuDrawTriGT_Mono4(const PolyVertex **vptrs)
 					c4 += dc4 * dclip;
 					xa = xmin;
 				}
-				if (all_opaque)
+				if (gpu_unai.blit_mask) {
+					if (all_opaque)
+						gpuPolySpanMono4OpaqueSkip(PixelBase + xa, xb - xa, gpu_unai.blit_mask, tba8, mono, u4, v4, c4, du4, dv4, dc4);
+					else
+						gpuPolySpanMono4MaskedSkip(PixelBase + xa, xb - xa, gpu_unai.blit_mask, tba8, mono, omask, u4, v4, c4, du4, dv4, dc4);
+				} else if (all_opaque)
 					gpuPolySpanMono4Opaque(PixelBase + xa, xb - xa, tba8, mono, u4, v4, c4, du4, dv4, dc4);
 				else
 					gpuPolySpanMono4Masked(PixelBase + xa, xb - xa, tba8, mono, omask, u4, v4, c4, du4, dv4, dc4);
@@ -1377,7 +1387,8 @@ void gpuDrawPolyGT(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_qua
 	PolyVertex vbuf[4];
 	polyInitVertexBuffer(vbuf, packet, POLYTYPE_GT, is_quad);
 
-	const bool can_mono4 = (gpuPolySpanDriver == gpuPolySpanFn<0xA1>) &&
+	const bool can_mono4 = (gpuPolySpanDriver == (PP)&gpuPolySpanFn<0xA1> ||
+	                        gpuPolySpanDriver == (PP)&gpuPolySpanFn<0x4A1>) &&
 	                       ((gpu_unai.u_msk & gpu_unai.v_msk) == 0x3ffff);
 
 	int total_passes = is_quad ? 2 : 1;

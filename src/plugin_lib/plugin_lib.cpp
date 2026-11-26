@@ -32,6 +32,7 @@
 #include "plugin_lib.h"
 #include "perfmon.h"
 #include "plugins.h"
+#include "aux/pcsx_aux.h"
 
 #ifdef USE_GPULIB
 #include "gpu/gpulib/gpu.h"
@@ -138,6 +139,9 @@ void pl_frame_limit(void)
 	}
 
 	if (Config.FrameLimit && (diff > pl_data.frame_interval)) {
+#ifdef RS97
+		pcsx_aux_flush();
+#endif
 		usleep(diff - pl_data.frame_interval);
 	}
 

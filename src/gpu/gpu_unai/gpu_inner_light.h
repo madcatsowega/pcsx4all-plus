@@ -204,6 +204,85 @@ static inline void gpuInvalidateMonoCLUTCache(void)
 {
 	for (int i = 0; i < 16; ++i)
 		gpu_unai.MonoCLUTCache[i].cba = NULL;
+	for (int i = 0; i < 4; ++i) {
+		gpu_unai.LitCLUT8Cache[i].cba = NULL;
+		gpu_unai.UnpackedCLUT4Cache[i].cba = NULL;
+	}
+	for (int i = 0; i < 2; ++i)
+		gpu_unai.UnpackedCLUT8Cache[i].cba = NULL;
+}
+
+static inline const u32* gpuGetLitCLUT8(const u16 *cba, u32 r5, u32 g5, u32 b5)
+{
+	const u32 rgb5 = (b5 << 10) | (g5 << 5) | r5;
+	const u32 idx = (((uintptr_t)cba >> 5) ^ rgb5) & 3u;
+	gpu_unai_t::LitCLUT8Slot *slot = &gpu_unai.LitCLUT8Cache[idx];
+	if (slot->cba != cba || slot->rgb5 != rgb5) {
+		slot->cba = cba;
+		slot->rgb5 = rgb5;
+		const u8 * __restrict__ lutR = gpu_unai.LightLUT + r5;
+		const u8 * __restrict__ lutG = gpu_unai.LightLUT + g5;
+		const u8 * __restrict__ lutB = gpu_unai.LightLUT + b5;
+		u32 * __restrict__ dst = slot->lit;
+		for (int i = 0; i < 256; ++i) {
+			u16 c = cba[i];
+			if (!c) {
+				dst[i] = 0;
+			} else {
+				u32 lc = ((u32)lutB[(c & 0x7C00) >> 5] << 10) |
+				         ((u32)lutG[ (c & 0x03E0)    ] <<  5) |
+				         ((u32)lutR[(c & 0x001F) << 5]      );
+				dst[i] = 0x00010000u | (c & 0x8000u) | lc;
+			}
+		}
+	}
+	return slot->lit;
+}
+
+static inline const u32* gpuGetUnpackedCLUT4(const u16 *cba, u32 maskset)
+{
+	const u32 idx = (((uintptr_t)cba >> 5) ^ maskset) & 3u;
+	gpu_unai_t::UnpackedCLUT4Slot *slot = &gpu_unai.UnpackedCLUT4Cache[idx];
+	if (slot->cba != cba || slot->maskset != maskset) {
+		slot->cba = cba;
+		slot->maskset = maskset;
+		u32 * __restrict__ dst = slot->uclut;
+		for (int i = 0; i < 16; ++i) {
+			u16 c = cba[i];
+			if (!c) {
+				dst[i] = 0;
+			} else {
+				u32 f = (maskset || (c & 0x8000u)) ? 0x80000000u : 0x01000000u;
+				dst[i] = f | (((u32)(c >> 10) & 0x1fu) << 16) |
+				             (((u32)(c >>  5) & 0x1fu) <<  8) |
+				              ((u32) c        & 0x1fu);
+			}
+		}
+	}
+	return slot->uclut;
+}
+
+static inline const u32* gpuGetUnpackedCLUT8(const u16 *cba, u32 maskset)
+{
+	const u32 idx = (((uintptr_t)cba >> 5) ^ maskset) & 1u;
+	gpu_unai_t::UnpackedCLUT8Slot *slot = &gpu_unai.UnpackedCLUT8Cache[idx];
+	if (slot->cba != cba || slot->maskset != maskset) {
+		slot->cba = cba;
+		slot->maskset = maskset;
+		u32 * __restrict__ dst = slot->uclut;
+		for (int i = 0; i < 256; ++i) {
+			u16 c = cba[i];
+			if (!c) {
+				dst[i] = 0;
+			} else {
+				u32 f = (maskset || (c & 0x8000u)) ? 0x80000000u : 0x01000000u;
+				dst[i] = f | (((u32)(c >> 10) & 0x1fu) << 16) |
+				             (((u32)(c >>  5) & 0x1fu) <<  8) |
+				              ((u32) c        & 0x1fu);
+			}
+		}
+	}
+	return slot->uclut;
 }
 
 static inline void gpuBuildMonoCLUTRow(u16 * __restrict__ dst, const u16 * __restrict__ cba,

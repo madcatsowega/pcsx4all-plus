@@ -19,10 +19,22 @@
  ***************************************************************************/
 
 #include "psxcommon.h"
+#include "misc.h"
 #include "plugin_lib/plugin_lib.h"
 
 void EmuUpdate()
 {
+	static int bench_state_checked = 0;
+	if (__builtin_expect(!bench_state_checked, 0)) {
+		bench_state_checked = 1;
+		const char *bs = getenv("PCSX_BENCH_STATE");
+		if (bs && bs[0]) {
+			int sr = LoadState(bs);
+			printf("[bench] LoadState(%s) -> %d\n", bs, sr);
+			fflush(stdout);
+			return;
+		}
+	}
 	pl_frame_limit();
 
 	// Update controls

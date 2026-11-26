@@ -1869,6 +1869,7 @@ static void ShowMenuItem(int x, int y, MENUITEM *mi)
 
 #if defined(RS97) && defined(SPU_PCSXREARMED)
 extern "C" int spu_use_mxu;
+extern "C" int pcsx_aux_is_active(void);
 #endif
 
 static void ShowMenu(MENU *menu)
@@ -1906,10 +1907,13 @@ static void ShowMenu(MENU *menu)
 	{
 		char badge[32];
 		int has_mxu = 0;
+		int has_aux = 0;
 #if defined(RS97) && defined(SPU_PCSXREARMED)
 		has_mxu = spu_use_mxu;
+		has_aux = pcsx_aux_is_active();
 #endif
-		snprintf(badge, sizeof(badge), "%s%s%s",
+		snprintf(badge, sizeof(badge), "%s%s%s%s",
+			has_aux ? "AUX " : "",
 			has_mxu ? "MXU " : "",
 #ifdef MMAP_TO_ADDRESS_ZERO
 			"MMAP0 ",

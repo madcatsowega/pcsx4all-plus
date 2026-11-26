@@ -35,11 +35,13 @@ MCD2_FILE = \"mcd002.mcr\"
 C_ARCH = -mips32 -mhard-float -mno-mips16 -mplt -mno-shared -DMMAP_TO_ADDRESS_ZERO -DDYNAREC_SKIP_DCACHE_FLUSH -DTMPFS_MIRRORING -DTMPFS_DIR=\"/tmp\" -DRS97
 # Non-LTO on GCC 7.3 outperforms GCC 11+ LTO on JZ4760B's 16 KB L1 I-cache
 OPTS = -O3 -fomit-frame-pointer -fwrapv -fno-strict-aliasing -mno-fp-exceptions -mframe-header-opt -mno-check-zero-division -fno-signed-zeros -fno-trapping-math -mno-interlink-compressed -fno-caller-saves
+PGO_GEN_DIR ?= /home/retrofw/profile/pcsx4all
+PGO_USE_DIR ?= ./profile
 ifeq ($(PGO),generate)
-OPTS += -fprofile-generate -fprofile-dir=/home/retrofw/profile/pcsx4all
+OPTS += -fprofile-generate -fprofile-dir=$(PGO_GEN_DIR)
 endif
 ifeq ($(PGO),use)
-OPTS += -fprofile-use -fprofile-dir=./profile -fprofile-correction -Wno-missing-profile -Wno-error=coverage-mismatch
+OPTS += -fprofile-use -fprofile-dir=$(PGO_USE_DIR) -fprofile-correction -Wno-missing-profile -Wno-error=coverage-mismatch
 endif
 
 CFLAGS = $(C_ARCH) -fno-common -fdata-sections -ffunction-sections $(OPTS) -DGCW_ZERO \
@@ -66,7 +68,7 @@ CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 LDFLAGS = $(C_ARCH) $(OPTS) -Wl,-Ttext-segment=0x40000000 -lz -Wl,--as-needed -Wl,--gc-sections -s
 LDFLAGS += $(SDL_LIBS) -lSDL_mixer -lSDL_image -lrt -lpthread -lm
 
-OBJDIRS = obj obj/gpu obj/gpu/$(GPU) obj/spu obj/spu/$(SPU) \
+OBJDIRS = obj obj/aux obj/gpu obj/gpu/$(GPU) obj/spu obj/spu/$(SPU) \
 	  obj/recompiler obj/recompiler/$(RECOMPILER) \
 	  obj/port obj/port/$(PORT) \
 	  obj/plugin_lib obj/port/common
@@ -142,7 +144,7 @@ OBJS += obj/spu/spu_pcsxrearmed/dma.o obj/spu/spu_pcsxrearmed/freeze.o \
 	obj/spu/spu_pcsxrearmed/registers.o
 ifdef RS97
 CFLAGS += -I/home/sean/retrofw-aux/include -I/home/sean/retrofw-aux/lib
-OBJS += obj/spu/spu_pcsxrearmed/spu_mxu.o
+OBJS += obj/aux/pcsx_aux.o obj/gpu/$(GPU)/gpu_mxu.o obj/spu/spu_pcsxrearmed/spu_mxu.o
 LDFLAGS += /home/sean/retrofw-aux/lib/libjzaux.a
 endif
 ifeq "$(ARCH)" "arm"
@@ -278,4 +280,4 @@ opk: all
 	pcsx4all/pcsx4all.png \
 	pcsx4all/backdrop.png \
 	pcsx4all/pcsx4all.opk \
-	-all-root -noappend -no-exports -no-xattrs
+	-all-root -noappend -no-exports -no-xattrs -comp gzip

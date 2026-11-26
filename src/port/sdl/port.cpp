@@ -12,6 +12,7 @@
 #include "plugins.h"
 #include "plugin_lib.h"
 #include "perfmon.h"
+#include "aux/pcsx_aux.h"
 #include <SDL.h>
 #include <SDL_image.h>
 
@@ -586,6 +587,9 @@ void pad_update(void)
 		sioSyncMcds();
 
 		emu_running = false;
+#ifdef RS97
+		pcsx_aux_flush();
+#endif
 		pl_pause();    // Tell plugin_lib we're pausing emu
 		GameMenu();
 		emu_running = true;
@@ -1269,6 +1273,9 @@ unsigned get_ticks(void)
 
 void wait_ticks(unsigned s)
 {
+#ifdef RS97
+	pcsx_aux_flush();
+#endif
 #ifdef TIME_IN_MSEC
 	SDL_Delay(s);
 #else

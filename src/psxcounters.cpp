@@ -40,6 +40,7 @@
 #include "psxcounters.h"
 #include "psxevents.h"
 #include "gpu.h"
+#include "aux/pcsx_prof.h"
 
 /******************************************************************************/
 
@@ -367,6 +368,7 @@ void psxRcntUpdate()
             }
 
             GPU_updateLace();
+            pcsx_prof_frame_tick();
 
             //senquack - PCSX Rearmed updates its SPU plugin once per emulated
             // frame. However, we target slower platforms and update SPU plugin

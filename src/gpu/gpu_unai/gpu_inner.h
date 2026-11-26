@@ -50,6 +50,9 @@
 
 #include "gpu_inner_quantization.h"
 #include "gpu_inner_light.h"
+#ifdef RS97
+#include "gpu_mxu.h"
+#endif
 
 // If defined, Gouraud colors are fixed-point 5.11, otherwise they are 8.16
 // This is only for debugging/verification of low-precision colors in C.
@@ -314,6 +317,29 @@ static void gpuTileSpanFn(u16 *pDst, u32 count, u16 data)
 		do { if (!(*pDst&0x8000)) { *pDst = data; } pDst++; } while (--count);
 	} else
 	{
+#ifdef RS97
+		if (!CF_MASKCHECK && CF_BLEND) {
+			const u32 maskor = CF_MASKSET ? 0x8000u : 0u;
+			if (CF_BLENDMODE == 0) {
+				gpu_blend_flat_m0_fast(pDst, count, data, maskor);
+				return;
+			}
+			if (spu_use_mxu) {
+				if (CF_BLENDMODE == 1) {
+					gpu_blend_flat_m1_mxu(pDst, count, data, maskor);
+					return;
+				}
+				if (CF_BLENDMODE == 2) {
+					gpu_blend_flat_m2_mxu(pDst, count, data, maskor);
+					return;
+				}
+				if (CF_BLENDMODE == 3) {
+					gpu_blend_flat_m1_mxu(pDst, count, (data >> 2) & 0x1ce7u, maskor);
+					return;
+				}
+			}
+		}
+#endif
 		// Blend func can save an operation if it knows uSrc MSB is
 		//  unset. For untextured prims, this is always true.
 		const bool skip_uSrc_mask = true;
@@ -562,6 +588,29 @@ static void gpuPolySpanFn(const gpu_unai_t & __restrict__ gpu_unai, u16 * __rest
 				gpuFillSpan16(pDst, count, CF_MASKSET ? (pix15 | 0x8000) : pix15);
 				return;
 			}
+#ifdef RS97
+			if (!CF_MASKCHECK && CF_BLEND) {
+				const u32 maskor = CF_MASKSET ? 0x8000u : 0u;
+				if (CF_BLENDMODE == 0) {
+					gpu_blend_flat_m0_fast(pDst, count, pix15, maskor);
+					return;
+				}
+				if (spu_use_mxu) {
+					if (CF_BLENDMODE == 1) {
+						gpu_blend_flat_m1_mxu(pDst, count, pix15, maskor);
+						return;
+					}
+					if (CF_BLENDMODE == 2) {
+						gpu_blend_flat_m2_mxu(pDst, count, pix15, maskor);
+						return;
+					}
+					if (CF_BLENDMODE == 3) {
+						gpu_blend_flat_m1_mxu(pDst, count, (pix15 >> 2) & 0x1ce7u, maskor);
+						return;
+					}
+				}
+			}
+#endif
 			do {
 				u16 uSrc, uDst;
 
@@ -591,6 +640,12 @@ endpolynotextnogou:
 			u32 l_gCol = gpu_unai.gCol;
 			u32 l_gInc = gpu_unai.gInc;
 
+#ifdef RS97
+			if (!CF_BLEND && !CF_MASKCHECK && !CF_DITHER) {
+				gpu_poly_gouraud_fast(pDst, count, l_gCol, l_gInc, CF_MASKSET ? 0x8000u : 0u);
+				return;
+			}
+#endif
 			do {
 				u16 uDst, uSrc;
 
@@ -725,14 +780,16 @@ endpoly_lit4:
 		}
 
 		// ================================================================
-		// Fast path 2: 4bpp unlit (1x spill-free, heavily used under fast_lighting=1)
+		// Fast path 2: 4bpp unlit (supports CF_BLITMASK at zero cost when off)
 		// ================================================================
-		if (CF_TEXTMODE == 1 && !CF_LIGHT && !CF_BLITMASK && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+		if (CF_TEXTMODE == 1 && !CF_LIGHT && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
 			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
 			do {
-				u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
-				u16 c0 = CBA_[(b0 >> ((l_u >> 8) & 4)) & 0xf];
-				if (c0) *pDst = CF_MASKSET ? (c0 | 0x8000) : c0;
+				if (!CF_BLITMASK || !((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+					u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+					u16 c0 = CBA_[(b0 >> ((l_u >> 8) & 4)) & 0xf];
+					if (c0) *pDst = CF_MASKSET ? (c0 | 0x8000) : c0;
+				}
 				pDst++;
 				l_u += l_u_inc;
 				l_v += l_v_inc;
@@ -741,19 +798,29 @@ endpoly_lit4:
 		}
 
 		// ================================================================
-		// Fast path 3: 4bpp Gouraud-lit undithered (1x spill-free + 1 KB LUT)
+		// Fast path 3: 4bpp Gouraud-lit undithered (MXU Q8MUL + 1x spill-free + CF_BLITMASK)
 		// ================================================================
-		if (CF_TEXTMODE == 1 && CF_LIGHT && CF_GOURAUD && !CF_DITHER && !CF_BLITMASK && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+		if (CF_TEXTMODE == 1 && CF_LIGHT && CF_GOURAUD && !CF_DITHER && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
 			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
+#ifdef RS97
+			if (!CF_BLITMASK && spu_use_mxu && count >= 8) {
+				const u32 *uclut = gpuGetUnpackedCLUT4(CBA_, CF_MASKSET ? 1u : 0u);
+				u32 params[6] = { l_u, l_v, (u32)l_u_inc, (u32)l_v_inc, l_gCol, l_gInc };
+				gpu_poly_gt4_rgb_mxu(pDst, count, tba8, uclut, params);
+				return;
+			}
+#endif
 			const u8 * __restrict__ lut  = gpu_unai.LightLUT;
 			do {
-				u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
-				u16 c0 = CBA_[(b0 >> ((l_u >> 8) & 4)) & 0xf];
-				if (c0) {
-					u16 lc = ((u16)lut[((c0 & 0x7C00) >> 5) | ((l_gCol >>  5) & 0x1F)] << 10) |
-					         ((u16)lut[ (c0 & 0x03E0)       | ((l_gCol >> 16) & 0x1F)] <<  5) |
-					         ((u16)lut[((c0 & 0x001F) << 5) |  (l_gCol >> 27)        ]      );
-					*pDst = CF_MASKSET ? (lc | 0x8000) : (lc | (c0 & 0x8000));
+				if (!CF_BLITMASK || !((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+					u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+					u16 c0 = CBA_[(b0 >> ((l_u >> 8) & 4)) & 0xf];
+					if (c0) {
+						u16 lc = ((u16)lut[((c0 & 0x7C00) >> 5) | ((l_gCol >>  5) & 0x1F)] << 10) |
+						         ((u16)lut[ (c0 & 0x03E0)       | ((l_gCol >> 16) & 0x1F)] <<  5) |
+						         ((u16)lut[((c0 & 0x001F) << 5) |  (l_gCol >> 27)        ]      );
+						*pDst = CF_MASKSET ? (lc | 0x8000) : (lc | (c0 & 0x8000));
+					}
 				}
 				pDst++;
 				l_u += l_u_inc;
@@ -764,35 +831,14 @@ endpoly_lit4:
 		}
 
 		// ================================================================
-		// Fast path 4: 8bpp unlit (1x spill-free)
+		// Fast path 4: 8bpp unlit (supports CF_BLITMASK)
 		// ================================================================
-		if (CF_TEXTMODE == 2 && !CF_LIGHT && !CF_BLITMASK && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+		if (CF_TEXTMODE == 2 && !CF_LIGHT && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
 			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
 			do {
-				u16 c0 = CBA_[tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 10) & 0xff)]];
-				if (c0) *pDst = CF_MASKSET ? (c0 | 0x8000) : c0;
-				pDst++;
-				l_u += l_u_inc;
-				l_v += l_v_inc;
-			} while (--count);
-			return;
-		}
-
-		// ================================================================
-		// Fast path 5: 8bpp flat-lit undithered (1x spill-free + pre-offset LUTs)
-		// ================================================================
-		if (CF_TEXTMODE == 2 && CF_LIGHT && !CF_GOURAUD && !CF_DITHER && !CF_BLITMASK && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
-			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
-			const u8 * __restrict__ lutR = gpu_unai.LightLUT + r5;
-			const u8 * __restrict__ lutG = gpu_unai.LightLUT + g5;
-			const u8 * __restrict__ lutB = gpu_unai.LightLUT + b5;
-			do {
-				u16 c0 = CBA_[tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 10) & 0xff)]];
-				if (c0) {
-					u16 lc = ((u16)lutB[(c0 & 0x7C00) >> 5] << 10) |
-					         ((u16)lutG[ (c0 & 0x03E0)    ] <<  5) |
-					         ((u16)lutR[(c0 & 0x001F) << 5]      );
-					*pDst = CF_MASKSET ? (lc | 0x8000) : (lc | (c0 & 0x8000));
+				if (!CF_BLITMASK || !((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+					u16 c0 = CBA_[tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 10) & 0xff)]];
+					if (c0) *pDst = CF_MASKSET ? (c0 | 0x8000) : c0;
 				}
 				pDst++;
 				l_u += l_u_inc;
@@ -802,18 +848,174 @@ endpoly_lit4:
 		}
 
 		// ================================================================
-		// Fast path 6: 16bpp unlit (1x spill-free)
+		// Fast path 5: 8bpp flat-lit undithered (4-slot cached LitCLUT8 + CF_BLITMASK)
 		// ================================================================
-		if (CF_TEXTMODE == 3 && !CF_LIGHT && !CF_BLITMASK && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+		if (CF_TEXTMODE == 2 && CF_LIGHT && !CF_GOURAUD && !CF_DITHER && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
+			const u32 * __restrict__ lit8 = gpuGetLitCLUT8(CBA_, r5, g5, b5);
+			if (!CF_BLITMASK) {
+				while (count >= 2) {
+					u32 u1 = l_u + l_u_inc;
+					u32 v1 = l_v + l_v_inc;
+					u32 p0 = lit8[tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 10) & 0xff)]];
+					u32 p1 = lit8[tba8[((v1  << 1) & (0xff << 11)) + ((u1  >> 10) & 0xff)]];
+					if (p0) pDst[0] = CF_MASKSET ? (u16)(p0 | 0x8000) : (u16)p0;
+					if (p1) pDst[1] = CF_MASKSET ? (u16)(p1 | 0x8000) : (u16)p1;
+					pDst += 2;
+					l_u = u1 + l_u_inc;
+					l_v = v1 + l_v_inc;
+					count -= 2;
+				}
+				if (count) {
+					u32 p0 = lit8[tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 10) & 0xff)]];
+					if (p0) *pDst = CF_MASKSET ? (u16)(p0 | 0x8000) : (u16)p0;
+				}
+			} else {
+				do {
+					if (!((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+						u32 p0 = lit8[tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 10) & 0xff)]];
+						if (p0) *pDst = CF_MASKSET ? (u16)(p0 | 0x8000) : (u16)p0;
+					}
+					pDst++;
+					l_u += l_u_inc;
+					l_v += l_v_inc;
+				} while (--count);
+			}
+			return;
+		}
+
+		// ================================================================
+		// Fast path 5b: 8bpp Gouraud-lit undithered (MXU Q8MUL + 1x spill-free + CF_BLITMASK)
+		// ================================================================
+		if (CF_TEXTMODE == 2 && CF_LIGHT && CF_GOURAUD && !CF_DITHER && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
+#ifdef RS97
+			if (!CF_BLITMASK && spu_use_mxu && count >= 8) {
+				const u32 *uclut = gpuGetUnpackedCLUT8(CBA_, CF_MASKSET ? 1u : 0u);
+				u32 params[6] = { l_u, l_v, (u32)l_u_inc, (u32)l_v_inc, l_gCol, l_gInc };
+				gpu_poly_gt8_rgb_mxu(pDst, count, tba8, uclut, params);
+				return;
+			}
+#endif
+			const u8 * __restrict__ lut = gpu_unai.LightLUT;
 			do {
-				u16 c0 = TBA_[(l_v & (0xff << 10)) + ((l_u >> 10) & 0xff)];
-				if (c0) *pDst = CF_MASKSET ? (c0 | 0x8000) : c0;
+				if (!CF_BLITMASK || !((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+					u16 c0 = CBA_[tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 10) & 0xff)]];
+					if (c0) {
+						u16 lc = ((u16)lut[((c0 & 0x7C00) >> 5) | ((l_gCol >>  5) & 0x1F)] << 10) |
+						         ((u16)lut[ (c0 & 0x03E0)       | ((l_gCol >> 16) & 0x1F)] <<  5) |
+						         ((u16)lut[((c0 & 0x001F) << 5) |  (l_gCol >> 27)        ]      );
+						*pDst = CF_MASKSET ? (lc | 0x8000) : (lc | (c0 & 0x8000));
+					}
+				}
+				pDst++;
+				l_u += l_u_inc;
+				l_v += l_v_inc;
+				l_gCol += l_gInc;
+			} while (--count);
+			return;
+		}
+
+		// ================================================================
+		// Fast path 6: 16bpp unlit (supports CF_BLITMASK)
+		// ================================================================
+		if (CF_TEXTMODE == 3 && !CF_LIGHT && !CF_MASKCHECK && !CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+			do {
+				if (!CF_BLITMASK || !((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+					u16 c0 = TBA_[(l_v & (0xff << 10)) + ((l_u >> 10) & 0xff)];
+					if (c0) *pDst = CF_MASKSET ? (c0 | 0x8000) : c0;
+				}
 				pDst++;
 				l_u += l_u_inc;
 				l_v += l_v_inc;
 			} while (--count);
 			return;
 		}
+
+		// ================================================================
+		// Fast path 7: 4bpp/8bpp unlit semi-transparent blend (supports CF_BLITMASK)
+		// ================================================================
+		if ((CF_TEXTMODE == 1 || CF_TEXTMODE == 2) && !CF_LIGHT && !CF_DITHER && !CF_MASKCHECK && CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
+			do {
+				if (!CF_BLITMASK || !((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+					u16 c0;
+					if (CF_TEXTMODE == 1) {
+						u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+						c0 = CBA_[(b0 >> ((l_u >> 8) & 4)) & 0xf];
+					} else {
+						c0 = CBA_[tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 10) & 0xff)]];
+					}
+					if (c0) {
+						u16 msb = c0 & 0x8000;
+						if (msb)
+							c0 = gpuBlending<CF_BLENDMODE, false>(c0, *pDst);
+						*pDst = CF_MASKSET ? (c0 | 0x8000) : (c0 | msb);
+					}
+				}
+				pDst++;
+				l_u += l_u_inc;
+				l_v += l_v_inc;
+			} while (--count);
+			return;
+		}
+
+		// ================================================================
+		// Fast path 8: 8bpp flat-lit & 4bpp/8bpp Gouraud-lit blended (supports CF_BLITMASK)
+		// ================================================================
+		if ((CF_TEXTMODE == 1 || CF_TEXTMODE == 2) && CF_LIGHT && !CF_DITHER && !CF_MASKCHECK && CF_BLEND && ((l_u_msk & l_v_msk) == 0x3ffff)) {
+			const u8 * __restrict__ tba8 = (const u8 *)TBA_;
+			if (CF_TEXTMODE == 2 && !CF_GOURAUD) {
+				const u32 * __restrict__ lit8 = gpuGetLitCLUT8(CBA_, r5, g5, b5);
+				do {
+					if (!CF_BLITMASK || !((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+						u32 p0 = lit8[tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 10) & 0xff)]];
+						if (p0) {
+							u16 c0 = (u16)p0;
+							u16 msb = c0 & 0x8000;
+							if (msb)
+								c0 = gpuBlending<CF_BLENDMODE, false>(c0, *pDst);
+							*pDst = CF_MASKSET ? (c0 | 0x8000) : (c0 | msb);
+						}
+					}
+					pDst++;
+					l_u += l_u_inc;
+					l_v += l_v_inc;
+				} while (--count);
+				return;
+			}
+			if (CF_GOURAUD) {
+				const u8 * __restrict__ lut = gpu_unai.LightLUT;
+				do {
+					if (!CF_BLITMASK || !((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+						u16 c0;
+						if (CF_TEXTMODE == 1) {
+							u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+							c0 = CBA_[(b0 >> ((l_u >> 8) & 4)) & 0xf];
+						} else {
+							c0 = CBA_[tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 10) & 0xff)]];
+						}
+						if (c0) {
+							u16 msb = c0 & 0x8000;
+							u16 lc = ((u16)lut[((c0 & 0x7C00) >> 5) | ((l_gCol >>  5) & 0x1F)] << 10) |
+							         ((u16)lut[ (c0 & 0x03E0)       | ((l_gCol >> 16) & 0x1F)] <<  5) |
+							         ((u16)lut[((c0 & 0x001F) << 5) |  (l_gCol >> 27)        ]      );
+							if (msb)
+								lc = gpuBlending<CF_BLENDMODE, true>(lc, *pDst);
+							*pDst = CF_MASKSET ? (lc | 0x8000) : (lc | msb);
+						}
+					}
+					pDst++;
+					l_u += l_u_inc;
+					l_v += l_v_inc;
+					l_gCol += l_gInc;
+				} while (--count);
+				return;
+			}
+		}
+
+		if (__builtin_expect(g_pcsx_prof.enabled, 0))
+			g_pcsx_prof.prim_fb_spans++;
 
 		do
 		{
@@ -957,6 +1159,83 @@ static void gpuPolySpanFlat4Masked(u16 * __restrict__ pDst, u32 count,
 		u32 idx = (b0 >> ((l_u >> 8) & 4)) & 0xf;
 		if ((omask >> idx) & 1)
 			*pDst = row[idx];
+		pDst++;
+		l_u += l_u_inc;
+		l_v += l_v_inc;
+	} while (--count);
+}
+
+/* BlitMask-enabled MonoCLUT4 / Flat4 span loops for 512/640 hi-res games (pixel_skip=1) */
+static void gpuPolySpanMono4OpaqueSkip(u16 * __restrict__ pDst, u32 count, u32 bMsk,
+                                       const u8 * __restrict__ tba8,
+                                       const u16 * __restrict__ mono,
+                                       u32 l_u, u32 l_v, u32 l_c,
+                                       s32 l_u_inc, s32 l_v_inc, s32 l_c_inc)
+{
+	do {
+		if (!((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+			u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+			*pDst = mono[((l_c >> 9) & 0x1F0) | ((b0 >> ((l_u >> 8) & 4)) & 0xf)];
+		}
+		pDst++;
+		l_u += l_u_inc;
+		l_v += l_v_inc;
+		l_c += l_c_inc;
+	} while (--count);
+}
+
+static void gpuPolySpanMono4MaskedSkip(u16 * __restrict__ pDst, u32 count, u32 bMsk,
+                                       const u8 * __restrict__ tba8,
+                                       const u16 * __restrict__ mono,
+                                       u32 omask,
+                                       u32 l_u, u32 l_v, u32 l_c,
+                                       s32 l_u_inc, s32 l_v_inc, s32 l_c_inc)
+{
+	do {
+		if (!((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+			u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+			u32 idx = (b0 >> ((l_u >> 8) & 4)) & 0xf;
+			if ((omask >> idx) & 1)
+				*pDst = mono[((l_c >> 9) & 0x1F0) | idx];
+		}
+		pDst++;
+		l_u += l_u_inc;
+		l_v += l_v_inc;
+		l_c += l_c_inc;
+	} while (--count);
+}
+
+static void gpuPolySpanFlat4OpaqueSkip(u16 * __restrict__ pDst, u32 count, u32 bMsk,
+                                       const u8 * __restrict__ tba8,
+                                       const u16 * __restrict__ row,
+                                       u32 l_u, u32 l_v,
+                                       s32 l_u_inc, s32 l_v_inc)
+{
+	do {
+		if (!((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+			u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+			*pDst = row[(b0 >> ((l_u >> 8) & 4)) & 0xf];
+		}
+		pDst++;
+		l_u += l_u_inc;
+		l_v += l_v_inc;
+	} while (--count);
+}
+
+static void gpuPolySpanFlat4MaskedSkip(u16 * __restrict__ pDst, u32 count, u32 bMsk,
+                                       const u8 * __restrict__ tba8,
+                                       const u16 * __restrict__ row,
+                                       u32 omask,
+                                       u32 l_u, u32 l_v,
+                                       s32 l_u_inc, s32 l_v_inc)
+{
+	do {
+		if (!((bMsk >> ((((uintptr_t)pDst) >> 1) & 7)) & 1)) {
+			u8 b0 = tba8[((l_v << 1) & (0xff << 11)) + ((l_u >> 11) & 0x7f)];
+			u32 idx = (b0 >> ((l_u >> 8) & 4)) & 0xf;
+			if ((omask >> idx) & 1)
+				*pDst = row[idx];
+		}
 		pDst++;
 		l_u += l_u_inc;
 		l_v += l_v_inc;

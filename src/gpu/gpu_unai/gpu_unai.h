@@ -259,6 +259,26 @@ struct gpu_unai_t {
 		u16 pad;
 		u16 rows[32][16];
 	} __attribute__((aligned(32))) MonoCLUTCache[16];
+
+	// 4-slot cache of pre-lit 8bpp flat-lit CLUTs (keyed by CBA + 15-bit light)
+	struct LitCLUT8Slot {
+		const u16 *cba;
+		u32 rgb5;
+		u32 lit[256];
+	} __attribute__((aligned(32))) LitCLUT8Cache[4];
+
+	// Unpacked [flag|B5|G5|R5] CLUT caches for MXU Q8MUL colored Gouraud lighting
+	struct UnpackedCLUT4Slot {
+		const u16 *cba;
+		u32 maskset;
+		u32 uclut[16];
+	} __attribute__((aligned(32))) UnpackedCLUT4Cache[4];
+
+	struct UnpackedCLUT8Slot {
+		const u16 *cba;
+		u32 maskset;
+		u32 uclut[256];
+	} __attribute__((aligned(32))) UnpackedCLUT8Cache[2];
 };
 
 static gpu_unai_t gpu_unai;

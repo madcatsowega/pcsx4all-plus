@@ -1133,6 +1133,9 @@ void do_samples(unsigned int cycles_to, int do_direct)
  unsigned int silentch;
  int cycle_diff;
  int ns_to;
+#ifdef RS97
+ uint64_t _ds_t0 = __builtin_expect(g_pcsx_prof.enabled, 0) ? pcsx_prof_now_us() : 0;
+#endif
 
  cycle_diff = cycles_to - spu.cycles_played;
  if (cycle_diff < -2*1048576 || cycle_diff > 2*1048576)
@@ -1230,6 +1233,10 @@ void do_samples(unsigned int cycles_to, int do_direct)
 
   spu.cycles_played += ns_to * 768;
   spu.decode_pos = (spu.decode_pos + ns_to) & 0x1ff;
+#ifdef RS97
+  if (__builtin_expect(g_pcsx_prof.enabled, 0))
+   g_pcsx_prof.spu_us += pcsx_prof_now_us() - _ds_t0;
+#endif
 }
 
 static void do_samples_finish(int *SSumLR, int ns_to,
@@ -1336,6 +1343,10 @@ void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)
   schedule_next_irq();
 
  if (flags & 1) {
+#ifdef RS97
+  if (g_aux_active)
+   spu_jzaux_flush();
+#endif
   out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);
   spu.pS = (short *)spu.pSpuBuffer;
 

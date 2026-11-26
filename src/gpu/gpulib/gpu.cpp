@@ -14,6 +14,7 @@
 #include "plugins.h"    // For GPUFreeze_t, GPUScreenInfo_t
 #include "gpu.h"
 #include "plugin_lib.h"
+#include "aux/pcsx_prof.h"
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #ifdef __GNUC__
@@ -578,7 +579,10 @@ static noinline int do_cmd_buffer(uint32_t *data, int count)
     else {
       int overlap_before = draw_area_overlaps_display();
       int has_unclipped = (cmd == 0x02 || cmd == 0x80);
+      uint64_t _pt0 = unlikely(g_pcsx_prof.enabled) ? pcsx_prof_now_us() : 0;
       pos += do_cmd_list(data + pos, count - pos, &cmd);
+      if (unlikely(g_pcsx_prof.enabled))
+        g_pcsx_prof.gpu_cmd_us += pcsx_prof_now_us() - _pt0;
       if (has_unclipped || overlap_before || draw_area_overlaps_display())
         vram_dirty = 1;
     }
@@ -791,7 +795,10 @@ void GPU_updateLace(void)
     gpu.frameskip.frame_ready = 0;
   }
 
+  uint64_t _vt0 = unlikely(g_pcsx_prof.enabled) ? pcsx_prof_now_us() : 0;
   vout_update();
+  if (unlikely(g_pcsx_prof.enabled))
+    g_pcsx_prof.vout_us += pcsx_prof_now_us() - _vt0;
   gpu.state.fb_dirty = 0;
   gpu.state.blanked = 0;
 }

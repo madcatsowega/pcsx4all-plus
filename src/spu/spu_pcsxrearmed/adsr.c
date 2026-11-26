@@ -239,9 +239,20 @@ static int SkipADSR(ADSRInfoEx *adsr, int ns_to)
    {
      v64 = EnvelopeVol;
      v64 += (int64_t)val * ns_to;
-     EnvelopeVol = (int)v64;
      if (v64 > 0)
+     {
+       EnvelopeVol = (int)v64;
        ns = ns_to;
+     }
+     else
+     {
+       for (; ns < ns_to; ns++)
+       {
+         EnvelopeVol += val;
+         if (EnvelopeVol <= 0)
+           break;
+       }
+     }
    }
    goto done;
  }
@@ -296,10 +307,11 @@ static int SkipADSR(ADSRInfoEx *adsr, int ns_to)
    case ADSR_SUSTAIN:                                  // -> sustain
      if (adsr->SustainIncrease)
      {
-       ns = ns_to;
-
        if (EnvelopeVol >= 0x7fff0000)
+       {
+         ns = ns_to;
          break;
+       }
 
        rto = 0;
        if (adsr->SustainModeExp && EnvelopeVol >= 0x60000000)
@@ -308,9 +320,11 @@ static int SkipADSR(ADSRInfoEx *adsr, int ns_to)
 
        v64 = EnvelopeVol;
        v64 += (int64_t)val * (ns_to - ns);
-       EnvelopeVol = (int)v64;
        if (v64 >= 0x7fe00000ll)
          EnvelopeVol = 0x7fffffff;
+       else
+         EnvelopeVol = (int)v64;
+       ns = ns_to;
      }
      else
      {
@@ -328,11 +342,19 @@ static int SkipADSR(ADSRInfoEx *adsr, int ns_to)
        {
          v64 = EnvelopeVol;
          v64 += (int64_t)val * (ns_to - ns);
-         EnvelopeVol = (int)v64;
-         if (v64 > 0)
+         if (v64 >= 0)
          {
+           EnvelopeVol = (int)v64;
            ns = ns_to;
-           break;
+         }
+         else
+         {
+           for (; ns < ns_to; ns++)
+           {
+             EnvelopeVol += val;
+             if (EnvelopeVol < 0)
+               break;
+           }
          }
        }
      }

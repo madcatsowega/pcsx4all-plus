@@ -27,6 +27,7 @@
 #include "gpu/gpulib/gpu.h"
 #include "port.h"
 #include "gpu_unai.h"
+#include "aux/pcsx_prof.h"
 
 #define GPU_INLINE static inline __attribute__((always_inline))
 
@@ -249,6 +250,26 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
     // gpu_unai.PacketBuffer below.
     PtrUnion packet = { .ptr = (void*)list };
 
+    if (__builtin_expect(g_pcsx_prof.enabled, 0)) {
+      if (cmd >= 0x20 && cmd <= 0x3F) {
+        if (cmd & 2) g_pcsx_prof.prim_blend++;
+        if (cmd & 0x10) {
+          if (cmd & 4) g_pcsx_prof.prim_gt++; else g_pcsx_prof.prim_g++;
+        } else {
+          if (cmd & 4) g_pcsx_prof.prim_ft++; else g_pcsx_prof.prim_f++;
+        }
+        if (cmd & 4) {
+          u32 tm = (cmd & 0x10) ? ((packet.U4[5] >> 23) & 3) : ((packet.U4[4] >> 23) & 3);
+          if (tm == 0) g_pcsx_prof.prim_tex4++;
+          else if (tm == 1) g_pcsx_prof.prim_tex8++;
+          else g_pcsx_prof.prim_tex16++;
+        }
+      } else if (cmd >= 0x60 && cmd <= 0x7F) {
+        if (cmd & 2) g_pcsx_prof.prim_blend++;
+        if (cmd & 4) g_pcsx_prof.prim_spr++; else g_pcsx_prof.prim_tile++;
+      }
+    }
+
     switch (cmd)
     {
       case 0x02:
@@ -331,6 +352,18 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x31:
       case 0x32:
       case 0x33: {          // Gouraud-shaded 3-pt poly
+        u32 c0 = packet.U4[0], c1 = packet.U4[2], c2 = packet.U4[4];
+        if (!Dithering && (((c0 ^ c1) | (c0 ^ c2)) & 0xF8F8F8u) == 0) {
+          u32 fp[4] = { c0, packet.U4[1], packet.U4[3], packet.U4[5] };
+          PtrUnion fpu = { .ptr = fp };
+          PP fdrv = gpuPolySpanDrivers[
+            (gpu_unai.blit_mask?1024:0) |
+            Blending_Mode |
+            gpu_unai.Masking | Blending | gpu_unai.PixelMSB
+          ];
+          gpuDrawPolyF(fpu, fdrv, false);
+          break;
+        }
         //NOTE: The '129' here is CF_GOURAUD | CF_LIGHT, however
         // this is an untextured poly, so CF_LIGHT (texture blend)
         // shouldn't apply. Until the original array of template
@@ -350,12 +383,43 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x37: {          // Gouraud-shaded, textured 3-pt poly
         gpuSetCLUT    (packet.U4[2] >> 16);
         gpuSetTexture (packet.U4[5] >> 16);
-        PP driver = gpuPolySpanDrivers[
+        u32 base_idx =
           (gpu_unai.blit_mask?1024:0) |
           Dithering |
           Blending_Mode | gpu_unai.TEXT_MODE |
-          gpu_unai.Masking | Blending | ((Lighting)?129:0) | gpu_unai.PixelMSB
-        ];
+          gpu_unai.Masking | Blending | gpu_unai.PixelMSB;
+        u32 c0 = packet.U4[0], c1 = packet.U4[3], c2 = packet.U4[6];
+        bool drop_light = !Lighting;
+        if (!drop_light && FastLightingEnabled()) {
+          if ((c0 & 0xff) > 0x5F && ((c0 >> 8) & 0xff) > 0x5F && ((c0 >> 16) & 0xff) > 0x5F &&
+              (c1 & 0xff) > 0x5F && ((c1 >> 8) & 0xff) > 0x5F && ((c1 >> 16) & 0xff) > 0x5F &&
+              (c2 & 0xff) > 0x5F && ((c2 >> 8) & 0xff) > 0x5F && ((c2 >> 16) & 0xff) > 0x5F)
+            drop_light = true;
+        }
+        if (!drop_light && !Dithering &&
+            (c0 & 0xF8F8F8u) == 0x808080u &&
+            (c1 & 0xF8F8F8u) == 0x808080u &&
+            (c2 & 0xF8F8F8u) == 0x808080u) {
+          drop_light = true;
+        }
+        if (drop_light) {
+          u32 fp[7] = { c0 | 0x01000000u, packet.U4[1], packet.U4[2],
+                        packet.U4[4], packet.U4[5], packet.U4[7], packet.U4[8] };
+          PtrUnion fpu = { .ptr = fp };
+          if (__builtin_expect(g_pcsx_prof.enabled, 0)) g_pcsx_prof.prim_gt_promo++;
+          gpuDrawPolyFT(fpu, gpuPolySpanDrivers[base_idx], false);
+          break;
+        }
+        u32 cmask = Dithering ? 0xFFFFFFu : 0xF8F8F8u;
+        if ((((c0 ^ c1) | (c0 ^ c2)) & cmask) == 0) {
+          u32 fp[7] = { c0, packet.U4[1], packet.U4[2],
+                        packet.U4[4], packet.U4[5], packet.U4[7], packet.U4[8] };
+          PtrUnion fpu = { .ptr = fp };
+          if (__builtin_expect(g_pcsx_prof.enabled, 0)) g_pcsx_prof.prim_gt_promo++;
+          gpuDrawPolyFT(fpu, gpuPolySpanDrivers[base_idx | 1], false);
+          break;
+        }
+        PP driver = gpuPolySpanDrivers[base_idx | 129];
         gpuDrawPolyGT(packet, driver, false);
       } break;
 
@@ -363,6 +427,18 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x39:
       case 0x3A:
       case 0x3B: {          // Gouraud-shaded 4-pt poly
+        u32 c0 = packet.U4[0], c1 = packet.U4[2], c2 = packet.U4[4], c3 = packet.U4[6];
+        if (!Dithering && (((c0 ^ c1) | (c0 ^ c2) | (c0 ^ c3)) & 0xF8F8F8u) == 0) {
+          u32 fp[5] = { c0, packet.U4[1], packet.U4[3], packet.U4[5], packet.U4[7] };
+          PtrUnion fpu = { .ptr = fp };
+          PP fdrv = gpuPolySpanDrivers[
+            (gpu_unai.blit_mask?1024:0) |
+            Blending_Mode |
+            gpu_unai.Masking | Blending | gpu_unai.PixelMSB
+          ];
+          gpuDrawPolyF(fpu, fdrv, true);
+          break;
+        }
         // See notes regarding '129' for 0x30..0x33 further above -senquack
         PP driver = gpuPolySpanDrivers[
           (gpu_unai.blit_mask?1024:0) |
@@ -379,12 +455,47 @@ int do_cmd_list(unsigned int *list, int list_len, int *last_cmd)
       case 0x3F: {          // Gouraud-shaded, textured 4-pt poly
         gpuSetCLUT    (packet.U4[2] >> 16);
         gpuSetTexture (packet.U4[5] >> 16);
-        PP driver = gpuPolySpanDrivers[
+        u32 base_idx =
           (gpu_unai.blit_mask?1024:0) |
           Dithering |
           Blending_Mode | gpu_unai.TEXT_MODE |
-          gpu_unai.Masking | Blending | ((Lighting)?129:0) | gpu_unai.PixelMSB
-        ];
+          gpu_unai.Masking | Blending | gpu_unai.PixelMSB;
+        u32 c0 = packet.U4[0], c1 = packet.U4[3], c2 = packet.U4[6], c3 = packet.U4[9];
+        bool drop_light = !Lighting;
+        if (!drop_light && FastLightingEnabled()) {
+          if ((c0 & 0xff) > 0x5F && ((c0 >> 8) & 0xff) > 0x5F && ((c0 >> 16) & 0xff) > 0x5F &&
+              (c1 & 0xff) > 0x5F && ((c1 >> 8) & 0xff) > 0x5F && ((c1 >> 16) & 0xff) > 0x5F &&
+              (c2 & 0xff) > 0x5F && ((c2 >> 8) & 0xff) > 0x5F && ((c2 >> 16) & 0xff) > 0x5F &&
+              (c3 & 0xff) > 0x5F && ((c3 >> 8) & 0xff) > 0x5F && ((c3 >> 16) & 0xff) > 0x5F)
+            drop_light = true;
+        }
+        if (!drop_light && !Dithering &&
+            (c0 & 0xF8F8F8u) == 0x808080u &&
+            (c1 & 0xF8F8F8u) == 0x808080u &&
+            (c2 & 0xF8F8F8u) == 0x808080u &&
+            (c3 & 0xF8F8F8u) == 0x808080u) {
+          drop_light = true;
+        }
+        if (drop_light) {
+          u32 fp[9] = { c0 | 0x01000000u, packet.U4[1], packet.U4[2],
+                        packet.U4[4], packet.U4[5], packet.U4[7], packet.U4[8],
+                        packet.U4[10], packet.U4[11] };
+          PtrUnion fpu = { .ptr = fp };
+          if (__builtin_expect(g_pcsx_prof.enabled, 0)) g_pcsx_prof.prim_gt_promo++;
+          gpuDrawPolyFT(fpu, gpuPolySpanDrivers[base_idx], true);
+          break;
+        }
+        u32 cmask = Dithering ? 0xFFFFFFu : 0xF8F8F8u;
+        if ((((c0 ^ c1) | (c0 ^ c2) | (c0 ^ c3)) & cmask) == 0) {
+          u32 fp[9] = { c0, packet.U4[1], packet.U4[2],
+                        packet.U4[4], packet.U4[5], packet.U4[7], packet.U4[8],
+                        packet.U4[10], packet.U4[11] };
+          PtrUnion fpu = { .ptr = fp };
+          if (__builtin_expect(g_pcsx_prof.enabled, 0)) g_pcsx_prof.prim_gt_promo++;
+          gpuDrawPolyFT(fpu, gpuPolySpanDrivers[base_idx | 1], true);
+          break;
+        }
+        PP driver = gpuPolySpanDrivers[base_idx | 129];
         gpuDrawPolyGT(packet, driver, true); // is_quad = true
       } break;
 

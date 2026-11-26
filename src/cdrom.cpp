@@ -34,6 +34,8 @@
 // Credit goes to Notaz / PCSX Rearmed, senquack
 
 #include "cdrom.h"
+#include "aux/pcsx_prof.h"
+#include "aux/pcsx_aux.h"
 #include "plugin_lib.h"
 #include "ppf.h"
 #include "psxdma.h"
@@ -427,6 +429,9 @@ static void ReadTrack(const u8 *time)
 
 	CDR_LOG("ReadTrack *** %02x:%02x:%02x\n", tmp[0], tmp[1], tmp[2]);
 
+#ifdef RS97
+	pcsx_aux_flush();
+#endif
 	cdr.RErr = CDR_readTrack(tmp);
 	memcpy(cdr.Prev, tmp, 3);
 
@@ -1152,6 +1157,7 @@ void cdrReadInterrupt() {
 		return;
 	}
 
+	uint64_t _cdt0 = __builtin_expect(g_pcsx_prof.enabled, 0) ? pcsx_prof_now_us() : 0;
 	memcpy(cdr.Transfer, buf, DATA_SIZE);
 
 	// PPF patch file support (ppf.cpp)
@@ -1184,6 +1190,8 @@ void cdrReadInterrupt() {
 			}
 			else cdr.FirstSector = -1;
 		}
+		if (__builtin_expect(g_pcsx_prof.enabled, 0))
+			g_pcsx_prof.cd_us += pcsx_prof_now_us() - _cdt0;
 
 #ifndef SPU_NULL
 		//senquack - if XA ADPCM buffer is not full, schedule next CDREAD_INT

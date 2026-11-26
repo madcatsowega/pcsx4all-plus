@@ -1,22 +1,18 @@
 /*
- * JZ4760B 339 MHz AUX/VPU XBurst+MXU Coprocessor SPU Offload Backend
- * Double-buffered zero-wait-state execution in TCSM0 (Slot 0) + upper TCSM1 (Slot 1)
- * + shared SB[] history in SRAM (0x132D0000).
+ * JZ4760B 330 MHz Hybrid AUX+MXU Coprocessor SPU Offload Backend
+ * Uses the shared 2-slot zero-wait-state FIFO ring in src/aux/pcsx_aux.c
+ * (TCSM0 Slot 0 + upper TCSM1 Slot 1 + shared SB[] in SRAM Bank 0).
  */
-#include <libjzaux.h>
-#include "/home/sean/retrofw-aux/firmware/pcsx_spu_proto.h"
-#include "/home/sean/retrofw-aux/firmware/aux_pcsx_spu_fw.h"
+#include "aux/pcsx_aux.h"
+#include "aux/pcsx_prof.h"
+#include "/home/sean/retrofw-aux/firmware/pcsx_hybrid_proto.h"
 
-static jz_aux_ctx_t *g_aux_ctx = NULL;
-static volatile struct aux_spu_sram *g_aux_sram = NULL;
-static volatile struct aux_spu_slot *g_aux_slots[2] = { NULL, NULL };
-static uint32_t g_aux_submit_seq = 0;
-static uint32_t g_aux_reap_seq = 0;
-static int g_aux_active = 0;
-static int *g_aux_orig_sb = NULL;
-static uint32_t g_aux_prof_jobs = 0;
-static uint32_t g_aux_prof_fallbacks = 0;
-static uint32_t g_aux_prof_waits = 0;
+static volatile struct aux_hybrid_sram *g_spu_aux_sram = NULL;
+static volatile struct aux_spu_slot *g_spu_aux_slots[2] = { NULL, NULL };
+static int g_spu_aux_active = 0;
+#define g_aux_active g_spu_aux_active
+static int *g_spu_aux_orig_sb = NULL;
+static uint32_t g_spu_aux_fallbacks = 0;
 
 static void spu_jzaux_copy_decode_buf(unsigned short *mem, int which,
                                       const volatile int16_t *src,
@@ -31,73 +27,71 @@ static void spu_jzaux_copy_decode_buf(unsigned short *mem, int which,
 	}
 }
 
-static void spu_jzaux_reap_one(void)
+static void spu_jzaux_on_reap(uint32_t idx)
 {
-	uint32_t seq = g_aux_reap_seq;
-	uint32_t idx = seq & 1U;
-	volatile struct aux_spu_slot *slot = g_aux_slots[idx];
-	int timeout = 5000000;
-	int waited = 0;
-
-	while (g_aux_sram->done_seq <= seq) {
-		waited = 1;
-		if (--timeout <= 0) {
-			/* Safety bailout: disable AUX and fall back to main CPU */
-			printf("[pcsx-aux] WARNING: AUX SPU timeout (done=%u want=%u), disabling AUX!\n",
-			       g_aux_sram->done_seq, seq + 1);
-			g_aux_active = 0;
-			g_aux_reap_seq = g_aux_submit_seq;
-			return;
-		}
-	}
-	if (waited)
-		g_aux_prof_waits++;
-
+	volatile struct aux_spu_slot *slot = g_spu_aux_slots[idx & 1U];
 	int ns_to = (int)slot->ns_to;
 	int n2 = ns_to * 2;
 	const volatile int32_t *src_lr = slot->SSumLR;
 	int *dst_lr = spu.SSumLR;
-	for (int i = 0; i < n2; i++)
+	int i = 0;
+	for (; i + 4 <= n2; i += 4) {
+		dst_lr[i]     = src_lr[i];
+		dst_lr[i + 1] = src_lr[i + 1];
+		dst_lr[i + 2] = src_lr[i + 2];
+		dst_lr[i + 3] = src_lr[i + 3];
+	}
+	for (; i < n2; i++)
 		dst_lr[i] = src_lr[i];
 
 	if (slot->do_rvb && slot->rvb_addr && spu.rvb->StartAddr &&
 	    slot->rvb_addr >= (uint32_t)spu.rvb->StartAddr && slot->rvb_addr < 0x40000U) {
+		uint64_t _rt0 = __builtin_expect(g_pcsx_prof.enabled, 0) ? pcsx_prof_now_us() : 0;
 		const volatile int32_t *src_r = slot->RVB;
 		int *dst_r = RVB;
-		for (int i = 0; i < n2; i++)
-			dst_r[i] = src_r[i];
+		int j = 0;
+		for (; j + 4 <= n2; j += 4) {
+			dst_r[j]     = src_r[j];
+			dst_r[j + 1] = src_r[j + 1];
+			dst_r[j + 2] = src_r[j + 2];
+			dst_r[j + 3] = src_r[j + 3];
+		}
+		for (; j < n2; j++)
+			dst_r[j] = src_r[j];
 		REVERBDo(spu.SSumLR, RVB, ns_to, (int)slot->rvb_addr);
+		if (__builtin_expect(g_pcsx_prof.enabled, 0))
+			g_pcsx_prof.rvb_us += pcsx_prof_now_us() - _rt0;
 	}
 
 	uint32_t dch = slot->decode_dirty_ch;
 	if (dch & (1U << 1)) {
-		spu_jzaux_copy_decode_buf(spu.spuMem, 0, g_aux_sram->decode_v1[idx], ns_to, (int)slot->decode_pos);
+		spu_jzaux_copy_decode_buf(spu.spuMem, 0, g_spu_aux_sram->decode_v1[idx & 1U], ns_to, (int)slot->decode_pos);
 		spu.decode_dirty_ch |= (1 << 1);
 	}
 	if (dch & (1U << 3)) {
-		spu_jzaux_copy_decode_buf(spu.spuMem, 1, g_aux_sram->decode_v3[idx], ns_to, (int)slot->decode_pos);
+		spu_jzaux_copy_decode_buf(spu.spuMem, 1, g_spu_aux_sram->decode_v3[idx & 1U], ns_to, (int)slot->decode_pos);
 		spu.decode_dirty_ch |= (1 << 3);
 	}
 
 	if ((unsigned char *)spu.pS + ns_to * 4 > spu.pSpuBuffer + 32768)
 		spu.pS = (short *)spu.pSpuBuffer;
 	do_samples_finish(spu.SSumLR, ns_to, (int)slot->channels_silent, (int)slot->decode_pos);
-	g_aux_reap_seq++;
-	g_aux_prof_jobs++;
 }
 
 static void spu_jzaux_reap_ready(void)
 {
-	if (!g_aux_active) return;
-	while (g_aux_reap_seq != g_aux_submit_seq && g_aux_sram->done_seq > g_aux_reap_seq)
-		spu_jzaux_reap_one();
+	if (!g_spu_aux_active) return;
+	pcsx_aux_reap_ready();
+	if (!pcsx_aux_is_active())
+		g_spu_aux_active = 0;
 }
 
 static void spu_jzaux_flush(void)
 {
-	if (!g_aux_active) return;
-	while (g_aux_reap_seq != g_aux_submit_seq && g_aux_active)
-		spu_jzaux_reap_one();
+	if (!g_spu_aux_active) return;
+	pcsx_aux_flush();
+	if (!pcsx_aux_is_active())
+		g_spu_aux_active = 0;
 }
 
 static int skip_block_collect(int ch, volatile uint8_t (*dst_blocks)[16], uint32_t *blk_total)
@@ -124,7 +118,6 @@ static int skip_block_collect(int ch, volatile uint8_t (*dst_blocks)[16], uint32
 	if (*blk_total >= AUX_SPU_MAX_BLOCKS)
 		return -1;
 
-	/* Copy 16-byte ADPCM block into TCSM as 4 aligned 32-bit words when possible */
 	volatile uint32_t *d32 = (volatile uint32_t *)dst_blocks[(*blk_total)++];
 	if (((uintptr_t)start & 3U) == 0) {
 		const uint32_t *s32 = (const uint32_t *)start;
@@ -170,7 +163,7 @@ static int do_samples_skip_collect(int ch, int ns_to,
 		while (spos >= 28 * 0x10000) {
 			d = skip_block_collect(ch, dst_blocks, blk_total);
 			if (d < 0)
-				return -1; /* ADPCM block buffer overflow */
+				return -1;
 			if (d && ns < ret)
 				ret = ns;
 			spos -= 28 * 0x10000;
@@ -184,7 +177,7 @@ static int do_samples_skip_collect(int ch, int ns_to,
 
 static int spu_jzaux_queue_slice(int ns_to, unsigned int silentch)
 {
-	if (!g_aux_active || ns_to <= 0 || ns_to > AUX_SPU_MAX_NS)
+	if (!g_spu_aux_active || !pcsx_aux_is_active() || ns_to <= 0 || ns_to > AUX_SPU_MAX_NS)
 		return 0;
 
 	/* Check if any active channel uses FMod (rare); if so, handle locally */
@@ -194,26 +187,41 @@ static int spu_jzaux_queue_slice(int ns_to, unsigned int silentch)
 			return 0;
 	}
 
-	spu_jzaux_reap_ready();
-	if ((g_aux_submit_seq - g_aux_reap_seq) >= 2U)
-		spu_jzaux_reap_one();
-	if (!g_aux_active)
+	uint32_t idx;
+	if (!pcsx_aux_acquire_slot(&idx)) {
+		g_spu_aux_active = 0;
 		return 0;
+	}
 
-	/* Snapshot mutable state in case ADPCM block buffer overflows (>544 blocks) */
-	SPUCHAN saved_ch[24];
+	struct {
+		unsigned char *pCurr;
+		unsigned char *pLoop;
+		int spos;
+		int iSBPos;
+		int prevflags;
+		int adsr_state;
+		int adsr_env;
+		unsigned char bRVBActive;
+	} saved_ch[24];
 	unsigned int saved_new = spu.dwNewChannel;
 	unsigned int saved_on = spu.dwChannelOn;
 	unsigned int saved_dead = spu.dwChannelDead;
 	int saved_rvb_curr = spu.rvb->CurrAddr;
 
-	uint32_t idx = g_aux_submit_seq & 1U;
-	volatile struct aux_spu_slot *slot = g_aux_slots[idx];
+	volatile struct aux_spu_slot *slot = g_spu_aux_slots[idx];
 
 	uint32_t new_mask = spu.dwNewChannel & 0xffffffU;
 	for (uint32_t m = new_mask, ch = 0; m != 0; ch++, m >>= 1) {
 		if (m & 1U) {
-			saved_ch[ch] = spu.s_chan[ch];
+			SPUCHAN *sc = &spu.s_chan[ch];
+			saved_ch[ch].pCurr      = sc->pCurr;
+			saved_ch[ch].pLoop      = sc->pLoop;
+			saved_ch[ch].spos       = sc->spos;
+			saved_ch[ch].iSBPos     = sc->iSBPos;
+			saved_ch[ch].prevflags  = sc->prevflags;
+			saved_ch[ch].adsr_state = sc->ADSRX.State;
+			saved_ch[ch].adsr_env   = sc->ADSRX.EnvelopeVol;
+			saved_ch[ch].bRVBActive = sc->bRVBActive;
 			StartSoundMain(ch);
 		}
 	}
@@ -223,10 +231,17 @@ static int spu_jzaux_queue_slice(int ns_to, unsigned int silentch)
 
 	for (uint32_t m = active_mask, ch = 0; m != 0; ch++, m >>= 1) {
 		if (!(m & 1U)) continue;
-		if (!(new_mask & (1U << ch)))
-			saved_ch[ch] = spu.s_chan[ch];
-
 		SPUCHAN *s_chan = &spu.s_chan[ch];
+		if (!(new_mask & (1U << ch))) {
+			saved_ch[ch].pCurr      = s_chan->pCurr;
+			saved_ch[ch].pLoop      = s_chan->pLoop;
+			saved_ch[ch].spos       = s_chan->spos;
+			saved_ch[ch].iSBPos     = s_chan->iSBPos;
+			saved_ch[ch].prevflags  = s_chan->prevflags;
+			saved_ch[ch].adsr_state = s_chan->ADSRX.State;
+			saved_ch[ch].adsr_env   = s_chan->ADSRX.EnvelopeVol;
+			saved_ch[ch].bRVBActive = s_chan->bRVBActive;
+		}
 		volatile struct aux_spu_ch *ac = &slot->ch[ch];
 
 		ac->spos  = s_chan->spos;
@@ -255,14 +270,24 @@ static int spu_jzaux_queue_slice(int ns_to, unsigned int silentch)
 		} else {
 			d = do_samples_skip_collect(ch, ns_to, slot->adpcm_blocks, &blk_total);
 			if (d < 0) {
-				/* Overflow (>544 ADPCM blocks in 1 slice): restore & run locally */
-				for (uint32_t rm = (active_mask | new_mask), rch = 0; rm != 0; rch++, rm >>= 1)
-					if (rm & 1U) spu.s_chan[rch] = saved_ch[rch];
+				for (uint32_t rm = (active_mask | new_mask), rch = 0; rm != 0; rch++, rm >>= 1) {
+					if (rm & 1U) {
+						SPUCHAN *sc = &spu.s_chan[rch];
+						sc->pCurr             = saved_ch[rch].pCurr;
+						sc->pLoop             = saved_ch[rch].pLoop;
+						sc->spos              = saved_ch[rch].spos;
+						sc->iSBPos            = saved_ch[rch].iSBPos;
+						sc->prevflags         = saved_ch[rch].prevflags;
+						sc->ADSRX.State       = saved_ch[rch].adsr_state;
+						sc->ADSRX.EnvelopeVol = saved_ch[rch].adsr_env;
+						sc->bRVBActive        = saved_ch[rch].bRVBActive;
+					}
+				}
 				spu.dwNewChannel  = saved_new;
 				spu.dwChannelOn   = saved_on;
 				spu.dwChannelDead = saved_dead;
 				spu.rvb->CurrAddr = saved_rvb_curr;
-				g_aux_prof_fallbacks++;
+				g_spu_aux_fallbacks++;
 				return 0;
 			}
 		}
@@ -297,108 +322,45 @@ static int spu_jzaux_queue_slice(int ns_to, unsigned int silentch)
 			spu.rvb->CurrAddr -= 0x40000 - spu.rvb->StartAddr;
 	}
 
-	__sync_synchronize();
-	g_aux_submit_seq++;
-	g_aux_sram->submit_seq = g_aux_submit_seq;
+	pcsx_aux_submit_slot(idx, AUX_CMD_SPU);
 	return 1;
 }
 
 static void spu_jzaux_init(void)
 {
-	if (g_aux_ctx)
+	pcsx_aux_init();
+	if (!pcsx_aux_is_active())
 		return;
 
-	jz_aux_ctx_t *ctx = jz_aux_open();
-	if (!ctx) {
-		printf("-> /dev/jz_aux not available; SPU running on main CPU.\n");
-		return;
-	}
-	if (!ctx->sram || ctx->sram_mapped_size < sizeof(struct aux_spu_sram)) {
-		printf("-> /dev/jz_aux SRAM too small (%u bytes); SPU on main CPU.\n",
-		       (unsigned)ctx->sram_mapped_size);
-		jz_aux_close(ctx);
-		return;
-	}
-	volatile uint8_t *tcsm1 = (volatile uint8_t *)jz_aux_map_tcsm1(ctx);
-	if (!tcsm1) {
-		printf("-> /dev/jz_aux TCSM1 mmap failed; SPU on main CPU.\n");
-		jz_aux_close(ctx);
-		return;
-	}
+	g_spu_aux_sram     = (volatile struct aux_hybrid_sram *)pcsx_aux_get_sram();
+	g_spu_aux_slots[0] = &((volatile union aux_hybrid_slot *)pcsx_aux_get_slot(0))->spu;
+	g_spu_aux_slots[1] = &((volatile union aux_hybrid_slot *)pcsx_aux_get_slot(1))->spu;
+	g_spu_aux_fallbacks = 0;
 
-	/* Zero shared SRAM control + SB[] before starting AUX */
-	volatile uint32_t *s32 = (volatile uint32_t *)ctx->sram;
-	for (size_t i = 0; i < (sizeof(struct aux_spu_sram) + 3) / 4; i++)
-		s32[i] = 0;
-
-	if (jz_aux_load(ctx, aux_pcsx_spu_fw, sizeof(aux_pcsx_spu_fw), 1, 1) < 0) {
-		printf("-> /dev/jz_aux firmware load failed; SPU on main CPU.\n");
-		jz_aux_close(ctx);
-		return;
-	}
-
-	volatile struct aux_spu_sram *sram = (volatile struct aux_spu_sram *)ctx->sram;
-	int tries = 200000;
-	while (sram->magic != AUX_SPU_MAGIC && --tries > 0)
-		;
-	if (sram->magic != AUX_SPU_MAGIC) {
-		printf("-> /dev/jz_aux firmware boot timeout (magic=0x%08x); SPU on main CPU.\n", sram->magic);
-		jz_aux_close(ctx);
-		return;
-	}
-
-	g_aux_ctx      = ctx;
-	g_aux_sram     = sram;
-	g_aux_slots[0] = (volatile struct aux_spu_slot *)ctx->tcsm0;
-	g_aux_slots[1] = (volatile struct aux_spu_slot *)(tcsm1 + AUX_SPU_SLOT1_OFFSET);
-	g_aux_submit_seq = 0;
-	g_aux_reap_seq   = 0;
-	g_aux_prof_jobs  = 0;
-	g_aux_prof_fallbacks = 0;
-	g_aux_prof_waits = 0;
+	pcsx_aux_register_spu(spu_jzaux_on_reap);
 
 	/* Share SB[] directly with AUX SRAM so savestates & fallbacks stay 100% coherent */
-	g_aux_orig_sb = spu.SB;
-	memcpy((void *)sram->SB, spu.SB, MAXCHAN * SB_SIZE * sizeof(int));
-	spu.SB = (int *)sram->SB;
+	g_spu_aux_orig_sb = spu.SB;
+	memcpy((void *)g_spu_aux_sram->SB, spu.SB, MAXCHAN * SB_SIZE * sizeof(int));
+	spu.SB = (int *)g_spu_aux_sram->SB;
 
-	g_aux_active = 1;
-	printf("-> JZ4760B AUX+MXU Coprocessor SPU OFFLOAD ACTIVE! (%u MHz HCLK, fw=%uB, 2-slot pipeline)\n",
-	       ctx->info.hclk_mhz, (unsigned)sizeof(aux_pcsx_spu_fw));
-	{
-		FILE *lf = fopen("/tmp/pcsx_aux.log", "w");
-		if (lf) {
-			fprintf(lf, "ACTIVE hclk=%uMHz cclk=%uMHz fw=%uB\n",
-			        ctx->info.hclk_mhz, ctx->info.cclk_mhz, (unsigned)sizeof(aux_pcsx_spu_fw));
-			fclose(lf);
-		}
-	}
+	g_spu_aux_active = 1;
 }
 
 static void spu_jzaux_shutdown(void)
 {
-	if (!g_aux_ctx)
+	if (!g_spu_aux_active && !pcsx_aux_is_active())
 		return;
 	spu_jzaux_flush();
-	printf("-> JZ4760B AUX SPU stats: jobs=%u fallbacks=%u waits=%u\n",
-	       g_aux_prof_jobs, g_aux_prof_fallbacks, g_aux_prof_waits);
-	{
-		FILE *lf = fopen("/tmp/pcsx_aux.log", "a");
-		if (lf) {
-			fprintf(lf, "SHUTDOWN jobs=%u fallbacks=%u waits=%u\n",
-			        g_aux_prof_jobs, g_aux_prof_fallbacks, g_aux_prof_waits);
-			fclose(lf);
-		}
+	if (g_spu_aux_orig_sb && g_spu_aux_sram) {
+		memcpy(g_spu_aux_orig_sb, (const void *)g_spu_aux_sram->SB, MAXCHAN * SB_SIZE * sizeof(int));
+		spu.SB = g_spu_aux_orig_sb;
+		g_spu_aux_orig_sb = NULL;
 	}
-	if (g_aux_orig_sb) {
-		memcpy(g_aux_orig_sb, (const void *)g_aux_sram->SB, MAXCHAN * SB_SIZE * sizeof(int));
-		spu.SB = g_aux_orig_sb;
-		g_aux_orig_sb = NULL;
-	}
-	g_aux_active = 0;
-	jz_aux_close(g_aux_ctx);
-	g_aux_ctx = NULL;
-	g_aux_sram = NULL;
-	g_aux_slots[0] = NULL;
-	g_aux_slots[1] = NULL;
+	pcsx_aux_register_spu(NULL);
+	g_spu_aux_active = 0;
+	pcsx_aux_shutdown();
+	g_spu_aux_sram = NULL;
+	g_spu_aux_slots[0] = NULL;
+	g_spu_aux_slots[1] = NULL;
 }
