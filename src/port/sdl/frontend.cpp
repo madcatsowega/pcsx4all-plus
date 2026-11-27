@@ -1408,7 +1408,7 @@ static int frameskip_alter(u32 keys)
 
 static char *frameskip_show()
 {
-	const char* str[] = { "auto", "off", "1", "2", "3" };
+	const char* str[] = { "auto", "off", "auto 2", "auto 3", "fixed 1" };
 
 	// Config.FrameSkip val range is -1..3
 	int fs = Config.FrameSkip + 1;

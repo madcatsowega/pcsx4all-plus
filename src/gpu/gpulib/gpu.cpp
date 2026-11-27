@@ -115,12 +115,22 @@ static noinline void decide_frameskip(void)
     gpu.frameskip.frame_ready = 1;
   }
 
-  if (!gpu.frameskip.active && pl_frameskip_advice())
-    gpu.frameskip.active = 1;
-  else if (gpu.frameskip.set > 0 && gpu.frameskip.cnt < gpu.frameskip.set)
-    gpu.frameskip.active = 1;
-  else
-    gpu.frameskip.active = 0;
+  if (gpu.frameskip.set == 3) {
+    /* Fixed 1-of-2 frameskip */
+    gpu.frameskip.active = (gpu.frameskip.cnt < 1) ? 1 : 0;
+  } else {
+    /* Smooth spaced auto-frameskip:
+     *   set == -1 ("auto"):   max 1 consecutive skip
+     *   set ==  1 ("auto 2"): max 2 consecutive skips
+     *   set ==  2 ("auto 3"): max 3 consecutive skips */
+    int max_skip = (gpu.frameskip.set < 0) ? 1 : (gpu.frameskip.set + 1);
+    if (gpu.frameskip.cnt < max_skip && pl_frameskip_advice()) {
+      gpu.frameskip.active = 1;
+      pl_frameskip_consume();
+    } else {
+      gpu.frameskip.active = 0;
+    }
+  }
 
   if (!gpu.frameskip.active && gpu.frameskip.pending_fill[0] != 0) {
     int dummy;
@@ -340,7 +350,9 @@ void GPU_writeStatus(uint32_t data)
       gpu.screen.y = new_y;
       if (flipped)
         gpu.state.fb_dirty = 1;
-      if (gpu.frameskip.set && (flipped || gpu.state.fb_dirty)) {
+      if (gpu.frameskip.set &&
+          (flipped || (gpu.state.fb_dirty &&
+                       (*gpu.state.frame_count - gpu.frameskip.last_flip_frame) >= 2))) {
         decide_frameskip_allow(gpu.ex_regs[3]);
         if (gpu.frameskip.last_flip_frame != *gpu.state.frame_count) {
           decide_frameskip();

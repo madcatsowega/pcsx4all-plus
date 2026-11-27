@@ -41,6 +41,7 @@ struct pl_data_t {
 	unsigned int dynarec_active_vsyncs;
 	float fps_cur, cpu_cur;
 	struct timeval tv_expect;
+	int64_t expect_us1024;
 
 	struct timeval tv_last_clear;
 	int clear_ctr;
@@ -63,6 +64,12 @@ void pl_clear_borders();
 static inline bool pl_frameskip_advice(void)
 {
 	return pl_data.fskip_advice;
+}
+
+/* Consume a single spaced auto-frameskip token so we skip 1 frame instead of a burst */
+static inline void pl_frameskip_consume(void)
+{
+	pl_data.fskip_advice = false;
 }
 
 // Dynamic recompilers call this to advise recompilation occurred

@@ -27,6 +27,7 @@
  */
 
 #include <unistd.h>
+#include <time.h>
 
 #include "psxcommon.h"
 #include "plugin_lib.h"
@@ -41,7 +42,14 @@
 static void pl_frameskip_prepare(void);
 static void pl_stats_update(void);
 
-#define MAX_LAG_FRAMES 3
+#define MAX_LAG_FRAMES 6
+
+static inline int64_t pl_now_us(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000000LL + (int64_t)(ts.tv_nsec / 1000);
+}
 
 #define tvdiff(tv, tv_old) \
 	((tv.tv_sec - tv_old.tv_sec) * 1000000 + tv.tv_usec - tv_old.tv_usec)
@@ -76,6 +84,7 @@ static void pl_frameskip_prepare(void)
 	pl_data.vsync_usec_time = now.tv_usec;
 	while (pl_data.vsync_usec_time >= pl_data.frame_interval)
 		pl_data.vsync_usec_time -= pl_data.frame_interval;
+	pl_data.expect_us1024 = pl_now_us() << 10;
 
 #ifdef USE_GPULIB
 	gpulib_frameskip_prepare();
@@ -86,15 +95,16 @@ static void pl_frameskip_prepare(void)
 void pl_frame_limit(void)
 {
 	struct timeval now;
-	int diff, usadj;
+	int64_t now_us, diff;
 
 	gettimeofday(&now, 0);
+	now_us = pl_now_us();
 
 	GPU_getScreenInfo(&pl_data.sinfo);
 
 	if (pl_data.clear_ctr > 0) {
-		diff = tvdiff(now, pl_data.tv_last_clear);
-		if (diff > 166667) {
+		int cdiff = tvdiff(now, pl_data.tv_last_clear);
+		if (cdiff > 166667) {
 			pl_data.clear_ctr--;
 			pl_data.tv_last_clear = now;
 			pl_clear_screen();
@@ -114,40 +124,57 @@ void pl_frame_limit(void)
 	    pl_data.is_pal != (Config.PsxType == PSXTYPE_PAL))
 	{
 		pl_frameskip_prepare();
+		now_us = pl_now_us();
 	}
 
-	// tv_expect uses usec*1024 units instead of usecs for better accuracy
-	pl_data.tv_expect.tv_usec += pl_data.frame_interval1024;
-	if (pl_data.tv_expect.tv_usec >= (1000000 << 10)) {
-		pl_data.tv_expect.tv_usec -= (1000000 << 10);
-		pl_data.tv_expect.tv_sec++;
-	}
-	diff = (pl_data.tv_expect.tv_sec - now.tv_sec) * 1000000 +
-	       (pl_data.tv_expect.tv_usec >> 10) - now.tv_usec;
+	// Advance expected monotonic VBlank deadline in usec*1024 units
+	pl_data.expect_us1024 += (int64_t)pl_data.frame_interval1024;
+	diff = (pl_data.expect_us1024 >> 10) - now_us;
 
-	if (diff > MAX_LAG_FRAMES * pl_data.frame_interval ||
-	    diff < -MAX_LAG_FRAMES * pl_data.frame_interval)
-	{
-		//printf("pl_frame_limit reset, diff=%d, iv %d\n", diff, frame_interval);
-		pl_data.tv_expect = now;
+	// Large positive jump (menu/resume) or severe stall (>6 frames = ~100ms): re-anchor cleanly
+	if (diff > (int64_t)MAX_LAG_FRAMES * pl_data.frame_interval) {
+		pl_data.expect_us1024 = now_us << 10;
 		diff = 0;
-		// try to align with vsync
-		usadj = pl_data.vsync_usec_time;
-		while (usadj < pl_data.tv_expect.tv_usec - pl_data.frame_interval)
-			usadj += pl_data.frame_interval;
-		pl_data.tv_expect.tv_usec = usadj << 10;
+		pl_data.fskip_advice = false;
+	} else if (diff < -(int64_t)MAX_LAG_FRAMES * pl_data.frame_interval) {
+		// Soft-clamp lag to -2 frames instead of resetting to 0 so skip cadence stays smooth
+		// without periodic stutter/surge waves on sub-fullspeed scenes.
+		int64_t clamp_lag = (int64_t)2 * pl_data.frame_interval;
+		pl_data.expect_us1024 = (now_us - clamp_lag) << 10;
+		diff = -clamp_lag;
 	}
 
-	if (Config.FrameLimit && (diff > pl_data.frame_interval)) {
+	// Hybrid precision frame pacer:
+	//   - Small 1/2-frame lead cushion (~8.3ms) absorbs micro-jitter with low latency.
+	//   - Coarse usleep() leaves a 10ms margin so Linux 2.6 jiffies NEVER overshoot the deadline.
+	//   - Final <=10ms finishes with tight monotonic polling (never enters cpu_idle()!).
+	if (Config.FrameLimit) {
+		int64_t cushion = (int64_t)(pl_data.frame_interval >> 1);
+		int64_t target_us = (pl_data.expect_us1024 >> 10) - cushion;
+		int64_t sleep_us = target_us - now_us;
+		if (sleep_us > 0) {
+			if (sleep_us > 11000) {
 #ifdef RS97
-		pcsx_aux_flush();
+				pcsx_aux_flush();
 #endif
-		usleep(diff - pl_data.frame_interval);
+				usleep((useconds_t)(sleep_us - 10000));
+			}
+			while (pl_now_us() < target_us) {
+#ifdef RS97
+				pcsx_aux_reap_ready();
+#endif
+			}
+			now_us = pl_now_us();
+			diff = (pl_data.expect_us1024 >> 10) - now_us;
+		}
 	}
 
-	if (diff < -pl_data.frame_interval) {
+	// Spaced 1-for-1 auto-frameskip trigger:
+	// Set advice once >=1 full frame behind; decide_frameskip() calls pl_frameskip_consume()
+	// immediately after skipping 1 frame so 55-57 FPS skips single spaced frames, never bursts!
+	if (diff < -(int64_t)pl_data.frame_interval) {
 		pl_data.fskip_advice = true;
-	} else if (diff >= 0) {
+	} else if (diff >= -(int64_t)(pl_data.frame_interval >> 1)) {
 		pl_data.fskip_advice = false;
 	}
 
